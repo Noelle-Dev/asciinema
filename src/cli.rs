@@ -25,6 +25,9 @@ pub struct Cli {
     pub quiet: bool,
 }
 
+// Edit has far more options than the other commands; the enum is built
+// once per run, so its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Record a terminal session to a file.
@@ -813,6 +816,23 @@ pub struct Edit {
         long_help
     )]
     pub fx_text: Option<String>,
+
+    /// Where --fx-text sits: nw, n, ne, w, c, e, sw, s or se (top left ... bottom right). Within --fx-area if given, else the whole screen.
+    #[arg(long, value_name = "WHERE", value_parser = ["nw", "n", "ne", "w", "c", "e", "sw", "s", "se"], default_value = "c", help = "Effect: where the text sits", long_help)]
+    pub fx_anchor: String,
+
+    /// A box for --fx-text to go in, as COL,ROW,COLSxROWS (0-based); --fx-anchor places the text within it.
+    #[arg(
+        long,
+        value_name = "COL,ROW,COLSxROWS",
+        help = "Effect: a box for the text",
+        long_help
+    )]
+    pub fx_area: Option<String>,
+
+    /// Draw --fx-text over the recording instead of on a cleared screen.
+    #[arg(long, help = "Effect: text over the recording", long_help)]
+    pub fx_over: bool,
 
     /// Part of the screen for --insert-effect to animate in place, as COL,ROW,COLSxROWS (0-based), e.g. 0,2,40x3.
     #[arg(

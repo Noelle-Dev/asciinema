@@ -232,7 +232,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, areas: Areas) {
 
         if matches!(
             app.fx.as_ref().map(|f| &f.mode),
-            Some(fxpanel::Mode::PickRegion)
+            Some(fxpanel::Mode::PickRegion { .. })
         ) {
             fxpanel::handle_preview_mouse(app, mouse, cell);
             return;

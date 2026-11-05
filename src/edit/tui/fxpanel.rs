@@ -34,6 +34,10 @@ const CAPTURE_DELAY: Duration = Duration::from_millis(150);
 pub enum Row {
     Effect,
     Animate,
+    // typed text only:
+    Position,
+    Area,
+    Background,
     Placement,
     Speed,
     Length,
@@ -44,9 +48,12 @@ pub enum Row {
     Apply,
 }
 
-const ROWS: [Row; 10] = [
+const ROWS: [Row; 13] = [
     Row::Effect,
     Row::Animate,
+    Row::Position,
+    Row::Area,
+    Row::Background,
     Row::Placement,
     Row::Speed,
     Row::Length,
@@ -75,8 +82,11 @@ pub enum Mode {
         choices: Vec<String>,
         selected: usize,
     },
-    /// Dragging a region on the preview.
-    PickRegion,
+    /// Dragging a region on the preview: the region to animate, or (for
+    /// typed text) the box the text goes in.
+    PickRegion {
+        text_box: bool,
+    },
     /// Editing a value in place; `back` is the options list to return to.
     Edit {
         field: Field,
@@ -100,8 +110,9 @@ pub struct FxPanel {
     pub hold: f64,
     /// Play instead of the current frame (or the selection) rather than after it.
     pub replace: bool,
-    /// The last typed text, offered again when switching back to typed text.
-    pub last_text: String,
+    /// The last typed text (with its layout), restored when switching back
+    /// to typed text.
+    pub last_text: FxSource,
     pub selected: usize,
     pub mode: Mode,
     pub preview: Option<Preview>,
@@ -117,6 +128,21 @@ pub struct FxPanel {
 }
 
 impl FxPanel {
+    /// The rows shown: the typed-text layout rows only for typed text.
+    pub fn rows(&self) -> Vec<Row> {
+        let typed = matches!(self.spec.source, FxSource::Text { .. });
+
+        ROWS.iter()
+            .copied()
+            .filter(|r| typed || !matches!(r, Row::Position | Row::Area | Row::Background))
+            .collect()
+    }
+
+    fn selected_row(&self) -> Row {
+        let rows = self.rows();
+        rows[self.selected.min(rows.len() - 1)]
+    }
+
     /// Whether a preview is being prepared.
     pub fn busy(&self) -> bool {
         self.capture_due.is_some() || self.job.is_some()
@@ -173,9 +199,7 @@ pub fn open(app: &mut App) {
     let source = if has_text {
         FxSource::Screen
     } else {
-        FxSource::Text {
-            text: "Hello".to_owned(),
-        }
+        FxSource::text("Hello")
     };
 
     app.fx = Some(FxPanel {
@@ -192,7 +216,7 @@ pub fn open(app: &mut App) {
         },
         hold: 1.0,
         replace: false,
-        last_text: "Hello".to_owned(),
+        last_text: FxSource::text("Hello"),
         selected: 0,
         mode: Mode::List,
         preview: None,
@@ -335,7 +359,7 @@ pub fn preview_screen(app: &App) -> Option<std::cell::Ref<'_, Vt>> {
     let panel = app.fx.as_ref()?;
 
     // picking a region: show the real screen, still, to pick from
-    if matches!(panel.mode, Mode::PickRegion) {
+    if matches!(panel.mode, Mode::PickRegion { .. }) {
         return None;
     }
     let preview = panel.preview.as_ref()?;
@@ -405,6 +429,8 @@ pub enum Field {
     Seed,
     Hold,
     Region,
+    /// The box typed text goes in.
+    TextBox,
     /// An effect option, by flag.
     Option(String),
 }
@@ -418,6 +444,7 @@ impl Field {
             Field::Length => Some(Row::Length),
             Field::Seed => Some(Row::Seed),
             Field::Hold => Some(Row::Hold),
+            Field::TextBox => Some(Row::Area),
             Field::Option(_) => None,
         }
     }
@@ -429,7 +456,7 @@ impl Field {
             Field::Length => "Type how many seconds it should run for, or leave it empty to go by the speed.".to_owned(),
             Field::Seed => "Type a whole number. The same seed gives the same animation.".to_owned(),
             Field::Hold => "Type how many seconds the last frame stays up.".to_owned(),
-            Field::Region => "Type the region as COL,ROW,COLSxROWS, counting from 0 - e.g. 0,2,40x3.".to_owned(),
+            Field::Region | Field::TextBox => "Type the box as COL,ROW,COLSxROWS, counting from 0 - e.g. 0,2,40x3.".to_owned(),
             Field::Option(flag) => format!("Type a value for {flag} (space separated for a list), or leave it empty for the default."),
         }
     }
@@ -437,9 +464,9 @@ impl Field {
 
 fn current_value(p: &FxPanel, field: &Field) -> String {
     match field {
-        Field::Text => match &p.spec.source {
-            FxSource::Text { text } => text.clone(),
-            _ => p.last_text.clone(),
+        Field::Text => match (&p.spec.source, &p.last_text) {
+            (FxSource::Text { text, .. }, _) | (_, FxSource::Text { text, .. }) => text.clone(),
+            _ => String::new(),
         }
         .replace('\n', "\\n"),
         Field::Speed => p.spec.speed.to_string(),
@@ -455,7 +482,20 @@ fn current_value(p: &FxPanel, field: &Field) -> String {
             } => format!("{col},{row},{cols}x{rows}"),
             _ => String::new(),
         },
+        Field::TextBox => match &p.spec.source {
+            FxSource::Text { area: Some(a), .. } => {
+                format!("{},{},{}x{}", a.col, a.row, a.cols, a.rows)
+            }
+            _ => String::new(),
+        },
         Field::Option(flag) => option_value(&p.spec.args, flag).unwrap_or_default(),
+    }
+}
+
+/// Changes typed text's box (keeping the rest of it).
+fn set_text_area(p: &mut FxPanel, new: Option<fx::Area>) {
+    if let FxSource::Text { area, .. } = &mut p.spec.source {
+        *area = new;
     }
 }
 
@@ -499,8 +539,19 @@ fn submit_edit(app: &mut App) {
 
         Field::Text => {
             let text = input.replace("\\n", "\n");
-            p.last_text = text.clone();
-            p.spec.source = FxSource::Text { text };
+
+            // keep the layout it had (or had last time it was typed text)
+            let mut source = match &p.spec.source {
+                FxSource::Text { .. } => p.spec.source.clone(),
+                _ => p.last_text.clone(),
+            };
+
+            if let FxSource::Text { text: t, .. } = &mut source {
+                *t = text;
+            }
+
+            p.last_text = source.clone();
+            p.spec.source = source;
             p.preview = None;
             None
         }
@@ -548,6 +599,28 @@ fn submit_edit(app: &mut App) {
                 p.preview = None;
                 None
             }
+            Err(e) => Some(format!("{e:#}")),
+        },
+
+        Field::TextBox => match crate::cmd::edit::parse_region(&input) {
+            Ok(FxSource::Region {
+                col,
+                row,
+                cols,
+                rows,
+            }) => {
+                set_text_area(
+                    p,
+                    Some(fx::Area {
+                        col,
+                        row,
+                        cols,
+                        rows,
+                    }),
+                );
+                None
+            }
+            Ok(_) => None,
             Err(e) => Some(format!("{e:#}")),
         },
 
@@ -629,6 +702,52 @@ fn dropdown_choices(app: &App, row: Row) -> Option<(Vec<String>, usize)> {
             },
         )),
 
+        Row::Position => {
+            let FxSource::Text { anchor, .. } = &p.spec.source else {
+                return None;
+            };
+
+            let choices = fx::Anchor::ALL
+                .iter()
+                .map(|a| {
+                    let l = a.label();
+                    l[..1].to_uppercase() + &l[1..]
+                })
+                .collect();
+
+            let at = fx::Anchor::ALL
+                .iter()
+                .position(|a| a == anchor)
+                .unwrap_or(4);
+
+            Some((choices, at))
+        }
+
+        Row::Area => {
+            let FxSource::Text { area, .. } = &p.spec.source else {
+                return None;
+            };
+
+            Some((
+                vec!["The whole screen".to_owned(), "A box… (drag it)".to_owned()],
+                usize::from(area.is_some()),
+            ))
+        }
+
+        Row::Background => {
+            let FxSource::Text { over, .. } = &p.spec.source else {
+                return None;
+            };
+
+            Some((
+                vec![
+                    "A cleared screen".to_owned(),
+                    "Over the recording".to_owned(),
+                ],
+                usize::from(*over),
+            ))
+        }
+
         Row::Placement => {
             let target = match app.selection() {
                 Some(_) => "Replace the selected frames",
@@ -660,8 +779,8 @@ fn choose(app: &mut App, row: Row, choice: usize) {
     // leaving typed text: remember it, and show the real screen straight away
     // rather than the old animation until the new capture is in
     if row == Row::Animate {
-        if let FxSource::Text { text } = &p.spec.source {
-            p.last_text = text.clone();
+        if let FxSource::Text { .. } = &p.spec.source {
+            p.last_text = p.spec.source.clone();
         }
 
         if choice != 0 {
@@ -673,13 +792,35 @@ fn choose(app: &mut App, row: Row, choice: usize) {
         (Row::Animate, 0) => return start_edit(app, Field::Text),
 
         (Row::Animate, 1) => {
-            p.mode = Mode::PickRegion;
+            p.mode = Mode::PickRegion { text_box: false };
             p.drag = None;
             return app
                 .info("Drag over the preview to choose the region (c to type it, Esc to cancel)");
         }
 
         (Row::Animate, _) => p.spec.source = FxSource::Screen,
+
+        (Row::Position, c) => {
+            if let FxSource::Text { anchor, .. } = &mut p.spec.source {
+                *anchor = fx::Anchor::ALL[c.min(8)];
+            }
+        }
+
+        (Row::Area, 0) => set_text_area(p, None),
+
+        (Row::Area, _) => {
+            p.mode = Mode::PickRegion { text_box: true };
+            p.drag = None;
+            return app.info(
+                "Drag over the preview to draw the text's box (c to type it, Esc to cancel)",
+            );
+        }
+
+        (Row::Background, c) => {
+            if let FxSource::Text { over, .. } = &mut p.spec.source {
+                *over = c == 1;
+            }
+        }
 
         // what's animated, and what it plays over, depend on this
         (Row::Placement, c) => p.replace = c == 1,
@@ -688,6 +829,8 @@ fn choose(app: &mut App, row: Row, choice: usize) {
         _ => return,
     }
 
+    // the typed-text rows come and go with the source
+    p.selected = p.selected.min(p.rows().len() - 1);
     refresh(app);
 }
 
@@ -748,7 +891,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('x') => app.fx = None,
             KeyCode::Up | KeyCode::Char('k') => panel.selected = panel.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                panel.selected = (panel.selected + 1).min(ROWS.len() - 1)
+                panel.selected = (panel.selected + 1).min(panel.rows().len() - 1)
             }
 
             KeyCode::Char('r') => {
@@ -760,7 +903,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('I') => apply(app),
 
             KeyCode::Enter => {
-                let row = ROWS[panel.selected];
+                let row = panel.selected_row();
                 activate(app, row);
             }
 
@@ -854,12 +997,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
 
-        Mode::PickRegion => match key.code {
+        Mode::PickRegion { text_box } => match key.code {
             KeyCode::Esc => {
                 panel.mode = Mode::List;
                 panel.drag = None;
             }
-            KeyCode::Char('c') => start_edit(app, Field::Region),
+            KeyCode::Char('c') => {
+                let field = if *text_box {
+                    Field::TextBox
+                } else {
+                    Field::Region
+                };
+                start_edit(app, field);
+            }
             _ => {}
         },
 
@@ -914,7 +1064,12 @@ fn activate(app: &mut App, row: Row) {
         Row::Apply => apply(app),
 
         // dropdowns, handled above
-        Row::Animate | Row::Placement | Row::Colors => {}
+        Row::Animate
+        | Row::Position
+        | Row::Area
+        | Row::Background
+        | Row::Placement
+        | Row::Colors => {}
     }
 }
 
@@ -923,7 +1078,7 @@ fn activate(app: &mut App, row: Row) {
 pub fn handle_preview_mouse(app: &mut App, mouse: MouseEvent, cell: Option<(usize, usize)>) {
     let Some(panel) = &mut app.fx else { return };
 
-    if !matches!(panel.mode, Mode::PickRegion) {
+    if !matches!(panel.mode, Mode::PickRegion { .. }) {
         return;
     }
 
@@ -938,12 +1093,27 @@ pub fn handle_preview_mouse(app: &mut App, mouse: MouseEvent, cell: Option<(usiz
 
         (MouseEventKind::Up(MouseButton::Left), _) => {
             if let Some(((ax, ay), (bx, by))) = panel.drag.take() {
-                panel.spec.source = FxSource::Region {
-                    col: ax.min(bx),
-                    row: ay.min(by),
-                    cols: ax.abs_diff(bx) + 1,
-                    rows: ay.abs_diff(by) + 1,
-                };
+                let (col, row) = (ax.min(bx), ay.min(by));
+                let (cols, rows) = (ax.abs_diff(bx) + 1, ay.abs_diff(by) + 1);
+
+                if matches!(panel.mode, Mode::PickRegion { text_box: true }) {
+                    set_text_area(
+                        panel,
+                        Some(fx::Area {
+                            col,
+                            row,
+                            cols,
+                            rows,
+                        }),
+                    );
+                } else {
+                    panel.spec.source = FxSource::Region {
+                        col,
+                        row,
+                        cols,
+                        rows,
+                    };
+                }
 
                 panel.mode = Mode::List;
                 panel.preview = None;
@@ -959,26 +1129,30 @@ pub fn handle_preview_mouse(app: &mut App, mouse: MouseEvent, cell: Option<(usiz
 pub fn highlighted_region(app: &App) -> Option<(usize, usize, usize, usize)> {
     let panel = app.fx.as_ref()?;
 
-    if !matches!(panel.mode, Mode::PickRegion) {
+    let Mode::PickRegion { text_box } = panel.mode else {
         return None;
-    }
+    };
 
-    match (panel.drag, &panel.spec.source) {
-        (Some(((ax, ay), (bx, by))), _) => Some((
+    if let Some(((ax, ay), (bx, by))) = panel.drag {
+        return Some((
             ax.min(bx),
             ay.min(by),
             ax.abs_diff(bx) + 1,
             ay.abs_diff(by) + 1,
-        )),
+        ));
+    }
+
+    match (&panel.spec.source, text_box) {
         (
-            None,
             FxSource::Region {
                 col,
                 row,
                 cols,
                 rows,
             },
+            false,
         ) => Some((*col, *row, *cols, *rows)),
+        (FxSource::Text { area: Some(a), .. }, true) => Some((a.col, a.row, a.cols, a.rows)),
         _ => None,
     }
 }
@@ -993,9 +1167,10 @@ pub fn handle_panel_mouse(app: &mut App, mouse: MouseEvent, inner: Rect) {
     let i = mouse.row.saturating_sub(inner.y) as usize;
 
     match &panel.mode {
-        Mode::List if i < ROWS.len() => {
+        Mode::List if i < panel.rows().len() => {
             if panel.selected == i {
-                activate(app, ROWS[i]);
+                let row = panel.rows()[i];
+                activate(app, row);
             } else {
                 panel.selected = i;
             }
@@ -1003,7 +1178,7 @@ pub fn handle_panel_mouse(app: &mut App, mouse: MouseEvent, inner: Rect) {
 
         // a click on a choice picks it; anywhere else closes the dropdown
         Mode::Dropdown { row, choices, .. } => {
-            let top = dropdown_top(inner, *row);
+            let top = dropdown_top(panel, inner, *row);
             let n = choices.len();
             let row = *row;
 
@@ -1039,6 +1214,31 @@ fn row_line(app: &App, panel: &FxPanel, row: Row) -> Line<'static> {
             Span::raw(s.source.describe()),
             arrow(),
         ]),
+
+        Row::Position | Row::Area | Row::Background => {
+            let FxSource::Text {
+                anchor, area, over, ..
+            } = &s.source
+            else {
+                return Line::from("");
+            };
+
+            let value = match row {
+                Row::Position => anchor.label().to_owned(),
+                Row::Area => match area {
+                    Some(a) => format!("a {}×{} box at {},{}", a.cols, a.rows, a.col, a.row),
+                    None => "the whole screen".to_owned(),
+                },
+                _ => if *over {
+                    "over the recording"
+                } else {
+                    "a cleared screen"
+                }
+                .to_owned(),
+            };
+
+            Line::from(vec![label(row_label(row)), Span::raw(value), arrow()])
+        }
 
         Row::Placement => {
             let what = match (panel.replace, app.selection()) {
@@ -1122,6 +1322,9 @@ fn row_label(row: Row) -> &'static str {
     match row {
         Row::Effect => "Effect",
         Row::Animate => "Animate",
+        Row::Position => "Position",
+        Row::Area => "Area",
+        Row::Background => "Background",
         Row::Placement => "Placement",
         Row::Speed => "Speed",
         Row::Length => "Length",
@@ -1146,6 +1349,9 @@ fn row_help(panel: &FxPanel, row: Row) -> String {
             format!("{desc}. Enter to browse the effects; each previews as you move.")
         }
         Row::Animate => "What the effect draws: typed text on a cleared screen, or text already on the screen - a region of it, or all of it - animated in place.".to_owned(),
+        Row::Position => "Where the text sits: in a corner, along an edge or in the centre - of the whole screen, or of its box.".to_owned(),
+        Row::Area => "Where the text can go: anywhere on the screen, or inside a box you draw over the preview. Position then places it within that area.".to_owned(),
+        Row::Background => "Play the text on a cleared screen, or over the recording so what's on screen stays visible around it.".to_owned(),
         Row::Placement => "Insert plays the effect after the frame you're on. Replace plays it instead of that frame (or the selected frames): they're cut, and the effect ends on the screen as it looked after them.".to_owned(),
         Row::Speed => "How fast the animation runs: 2 is twice as fast, 0.5 half as fast. Setting a speed clears the length.".to_owned(),
         Row::Length => "Fit the animation to this many seconds; the speed is worked out to match. Leave empty to go by the speed.".to_owned(),
@@ -1158,8 +1364,8 @@ fn row_help(panel: &FxPanel, row: Row) -> String {
 }
 
 /// Screen row of `row`'s line in the list.
-fn dropdown_top(inner: Rect, row: Row) -> u16 {
-    inner.y + ROWS.iter().position(|r| *r == row).unwrap_or(0) as u16
+fn dropdown_top(panel: &FxPanel, inner: Rect, row: Row) -> u16 {
+    inner.y + panel.rows().iter().position(|r| *r == row).unwrap_or(0) as u16
 }
 
 pub fn draw(buf: &mut Buffer, area: Rect, app: &App) -> Rect {
@@ -1171,7 +1377,8 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &App) -> Rect {
         Mode::List | Mode::Dropdown { .. } => format!(" effect ({}) ", panel.tool.name()),
         Mode::Effects { .. } => " choose an effect ".to_owned(),
         Mode::Options { .. } => format!(" {} options ", panel.spec.effect),
-        Mode::PickRegion => " drag a region on the preview ".to_owned(),
+        Mode::PickRegion { text_box: false } => " drag a region on the preview ".to_owned(),
+        Mode::PickRegion { text_box: true } => " drag the text's box on the preview ".to_owned(),
         Mode::Edit { back: Some(_), .. } => format!(" {} options ", panel.spec.effect),
         Mode::Edit { .. } => format!(" effect ({}) ", panel.tool.name()),
     };
@@ -1284,7 +1491,9 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &App) -> Rect {
             help_at(buf, inner.bottom().saturating_sub(3), e.description.clone());
         }
     } else {
-        for (i, row) in ROWS.iter().enumerate() {
+        let rows = panel.rows();
+
+        for (i, row) in rows.iter().enumerate() {
             let mut line = match editing {
                 Some((field, input)) if field.row() == Some(*row) => Line::from(vec![
                     label(row_label(*row)),
@@ -1293,7 +1502,9 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &App) -> Rect {
                 _ => row_line(app, panel, *row),
             };
 
-            if i == panel.selected && !matches!(panel.mode, Mode::PickRegion) {
+            if i == panel.selected.min(rows.len() - 1)
+                && !matches!(panel.mode, Mode::PickRegion { .. })
+            {
                 line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
             }
 
@@ -1302,10 +1513,10 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &App) -> Rect {
 
         let help = match editing {
             Some((field, _)) => format!("{}  Enter applies, Esc cancels.", field.help()),
-            None => row_help(panel, ROWS[panel.selected]),
+            None => row_help(panel, panel.selected_row()),
         };
 
-        help_at(buf, inner.y + ROWS.len() as u16 + 1, help);
+        help_at(buf, inner.y + rows.len() as u16 + 1, help);
 
         // the dropdown opens just under its row, over the rows below
         if let Mode::Dropdown {
@@ -1314,7 +1525,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, app: &App) -> Rect {
             selected,
         } = &panel.mode
         {
-            let y = dropdown_top(inner, *row) + 1;
+            let y = dropdown_top(panel, inner, *row) + 1;
             let x = inner.x + LABEL_W as u16 - 1;
             let w = inner.width.saturating_sub(LABEL_W as u16 - 1);
             let h = (choices.len() as u16 + 2).min(inner.bottom().saturating_sub(y));
@@ -1366,7 +1577,7 @@ pub fn hints(panel: &FxPanel) -> &'static [(&'static str, &'static str)] {
             ("d", "back to default"),
             ("esc", "done"),
         ],
-        Mode::PickRegion => &[
+        Mode::PickRegion { .. } => &[
             ("drag", "select region"),
             ("c", "type it"),
             ("esc", "cancel"),
@@ -1415,9 +1626,7 @@ printf '\033[?25h'
             effects: Vec::new(),
             spec: FxSpec {
                 effect: "decrypt".to_owned(),
-                source: FxSource::Text {
-                    text: "hi".to_owned(),
-                },
+                source: FxSource::text("hi"),
                 args: Vec::new(),
                 speed: 1.0,
                 duration: None,
@@ -1426,7 +1635,7 @@ printf '\033[?25h'
             },
             hold: 0.5,
             replace: false,
-            last_text: "hi".to_owned(),
+            last_text: FxSource::text("hi"),
             selected: 0,
             mode: Mode::List,
             preview: None,
@@ -1732,7 +1941,91 @@ printf '\033[?25h'
         activate(&mut a, Row::Animate);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Enter); // a region
-        assert!(matches!(a.fx.as_ref().unwrap().mode, Mode::PickRegion));
+        assert!(matches!(
+            a.fx.as_ref().unwrap().mode,
+            Mode::PickRegion { .. }
+        ));
         assert!(preview_screen(&a).is_none(), "the real screen, still");
+    }
+
+    #[test]
+    fn typed_text_layout() {
+        use crate::edit::fx::{Anchor, Area};
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut a, dir) = app();
+        a.seek_position(3);
+        a.fx = Some(panel(fake_tool(dir.path())));
+
+        // the layout rows are there for typed text
+        let rows = a.fx.as_ref().unwrap().rows();
+        assert!(rows.contains(&Row::Position) && rows.contains(&Row::Background));
+
+        // position: bottom right
+        activate(&mut a, Row::Position);
+        for _ in 0..4 {
+            key(&mut a, KeyCode::Down);
+        }
+        key(&mut a, KeyCode::Enter);
+
+        // background: over the recording
+        activate(&mut a, Row::Background);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Enter);
+
+        // area: drag a box from (2,1) to (11,3)
+        activate(&mut a, Row::Area);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.fx.as_ref().unwrap().mode,
+            Mode::PickRegion { text_box: true }
+        ));
+
+        let ev = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        super::handle_preview_mouse(
+            &mut a,
+            ev(MouseEventKind::Down(MouseButton::Left)),
+            Some((2, 1)),
+        );
+        super::handle_preview_mouse(
+            &mut a,
+            ev(MouseEventKind::Drag(MouseButton::Left)),
+            Some((11, 3)),
+        );
+        super::handle_preview_mouse(&mut a, ev(MouseEventKind::Up(MouseButton::Left)), None);
+
+        let expected = FxSource::Text {
+            text: "hi".to_owned(),
+            anchor: Anchor::Se,
+            area: Some(Area {
+                col: 2,
+                row: 1,
+                cols: 10,
+                rows: 3,
+            }),
+            over: true,
+        };
+        assert_eq!(a.fx.as_ref().unwrap().spec.source, expected);
+
+        // the layout rows go away for the whole screen...
+        activate(&mut a, Row::Animate);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Enter);
+        assert!(!a.fx.as_ref().unwrap().rows().contains(&Row::Position));
+
+        // ...and editing the text again brings the whole layout back
+        activate(&mut a, Row::Animate);
+        key(&mut a, KeyCode::Up);
+        key(&mut a, KeyCode::Up);
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.fx.as_ref().unwrap().spec.source, expected);
     }
 }

@@ -242,6 +242,25 @@ impl cli::Edit {
         let source = match (&self.fx_text, &self.fx_region, self.fx_screen) {
             (Some(text), None, false) => fx::FxSource::Text {
                 text: text.replace("\\n", "\n"),
+                anchor: fx::Anchor::from_flag(&self.fx_anchor).unwrap_or_default(),
+                area: match &self.fx_area {
+                    Some(a) => match parse_region(a)? {
+                        fx::FxSource::Region {
+                            col,
+                            row,
+                            cols,
+                            rows,
+                        } => Some(fx::Area {
+                            col,
+                            row,
+                            cols,
+                            rows,
+                        }),
+                        _ => None,
+                    },
+                    None => None,
+                },
+                over: self.fx_over,
             },
             (None, Some(region), false) => parse_region(region)?,
             (None, None, true) => fx::FxSource::Screen,
@@ -736,6 +755,9 @@ mod tests {
             insert_effect: None,
             replace_effect: None,
             fx_duration: None,
+            fx_anchor: "c".to_owned(),
+            fx_area: None,
+            fx_over: false,
             fx_text: None,
             fx_region: None,
             fx_screen: false,

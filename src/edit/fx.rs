@@ -97,8 +97,19 @@ pub fn find_tool() -> Result<Tool> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FxSource {
-    /// Typed text, centered on a cleared screen.
-    Text { text: String },
+    /// Typed text, on a cleared screen or over the recording.
+    Text {
+        text: String,
+        /// Where the text sits in its area.
+        #[serde(default, skip_serializing_if = "Anchor::is_center")]
+        anchor: Anchor,
+        /// The area the text is placed in; the whole screen when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        area: Option<Area>,
+        /// Draw over the recording instead of on a cleared screen.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        over: bool,
+    },
     /// A rectangle of the screen at the insert point; animated in place.
     Region {
         col: usize,
@@ -110,11 +121,116 @@ pub enum FxSource {
     Screen,
 }
 
+/// A rectangle of the screen, in cells (0-based).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Area {
+    pub col: usize,
+    pub row: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// Where text sits within its area (the tools' `--anchor-text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Anchor {
+    Nw,
+    N,
+    Ne,
+    W,
+    #[default]
+    C,
+    E,
+    Sw,
+    S,
+    Se,
+}
+
+impl Anchor {
+    /// In reading order: top row, middle row, bottom row.
+    pub const ALL: [Anchor; 9] = [
+        Anchor::Nw,
+        Anchor::N,
+        Anchor::Ne,
+        Anchor::W,
+        Anchor::C,
+        Anchor::E,
+        Anchor::Sw,
+        Anchor::S,
+        Anchor::Se,
+    ];
+
+    pub fn flag(self) -> &'static str {
+        match self {
+            Anchor::Nw => "nw",
+            Anchor::N => "n",
+            Anchor::Ne => "ne",
+            Anchor::W => "w",
+            Anchor::C => "c",
+            Anchor::E => "e",
+            Anchor::Sw => "sw",
+            Anchor::S => "s",
+            Anchor::Se => "se",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Anchor::Nw => "top left",
+            Anchor::N => "top",
+            Anchor::Ne => "top right",
+            Anchor::W => "left",
+            Anchor::C => "centre",
+            Anchor::E => "right",
+            Anchor::Sw => "bottom left",
+            Anchor::S => "bottom",
+            Anchor::Se => "bottom right",
+        }
+    }
+
+    pub fn from_flag(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.flag() == s)
+    }
+
+    fn is_center(&self) -> bool {
+        *self == Anchor::C
+    }
+}
+
 impl FxSource {
+    /// Typed text, centered on a cleared screen.
+    pub fn text(text: impl Into<String>) -> Self {
+        FxSource::Text {
+            text: text.into(),
+            anchor: Anchor::C,
+            area: None,
+            over: false,
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
-            FxSource::Text { text } => {
-                format!("\"{}\"", text.lines().next().unwrap_or(""))
+            FxSource::Text {
+                text,
+                anchor,
+                area,
+                over,
+            } => {
+                let mut s = format!("\"{}\"", text.lines().next().unwrap_or(""));
+
+                if *anchor != Anchor::C || area.is_some() {
+                    s.push_str(&format!(" {}", anchor.label()));
+                }
+
+                if area.is_some() {
+                    s.push_str(" of a box");
+                }
+
+                if *over {
+                    s.push_str(" over the recording");
+                }
+
+                s
             }
             FxSource::Region {
                 col,
@@ -162,7 +278,12 @@ impl FxSpec {
         }
 
         match &self.source {
-            FxSource::Text { text } if text.trim().is_empty() => bail!("an effect needs some text"),
+            FxSource::Text { text, .. } if text.trim().is_empty() => {
+                bail!("an effect needs some text")
+            }
+            FxSource::Text { area: Some(a), .. } if a.cols == 0 || a.rows == 0 => {
+                bail!("the text's box is empty")
+            }
             FxSource::Region { cols, rows, .. } if *cols == 0 || *rows == 0 => {
                 bail!("the effect region is empty")
             }
@@ -181,6 +302,9 @@ struct Canvas {
     anchor_text: &'static str,
     /// Clear the screen first (typed text replaces the screen).
     clear: bool,
+    /// The screen's cells under the canvas, when drawing over it: the tool's
+    /// blank cells let these show through.
+    background: Option<Vec<Vec<avt::Cell>>>,
 }
 
 /// Works out the effect's input text and canvas from the screen it plays over.
@@ -188,17 +312,51 @@ fn layout(spec: &FxSpec, screen: &Vt) -> Result<(String, Canvas)> {
     let (cols, rows) = screen.size();
 
     match &spec.source {
-        FxSource::Text { text } => Ok((
-            text.clone(),
-            Canvas {
+        FxSource::Text {
+            text,
+            anchor,
+            area,
+            over,
+        } => {
+            let a = area.unwrap_or(Area {
                 col: 0,
                 row: 0,
                 cols,
                 rows,
-                anchor_text: "c",
-                clear: true,
-            },
-        )),
+            });
+
+            if a.col + a.cols > cols || a.row + a.rows > rows {
+                bail!(
+                    "the text's box {}×{} at {},{} doesn't fit the {cols}×{rows} screen",
+                    a.cols,
+                    a.rows,
+                    a.col,
+                    a.row
+                );
+            }
+
+            let background = over.then(|| {
+                screen
+                    .view()
+                    .skip(a.row)
+                    .take(a.rows)
+                    .map(|l| l.cells().iter().skip(a.col).take(a.cols).copied().collect())
+                    .collect()
+            });
+
+            Ok((
+                text.clone(),
+                Canvas {
+                    col: a.col,
+                    row: a.row,
+                    cols: a.cols,
+                    rows: a.rows,
+                    anchor_text: anchor.flag(),
+                    clear: !over,
+                    background,
+                },
+            ))
+        }
 
         FxSource::Screen => Ok((
             screen_text(screen, 0, 0, cols, rows, spec.keep_colors),
@@ -209,6 +367,7 @@ fn layout(spec: &FxSpec, screen: &Vt) -> Result<(String, Canvas)> {
                 rows,
                 anchor_text: "nw",
                 clear: false,
+                background: None,
             },
         )),
 
@@ -233,6 +392,7 @@ fn layout(spec: &FxSpec, screen: &Vt) -> Result<(String, Canvas)> {
                     rows: *h,
                     anchor_text: "nw",
                     clear: false,
+                    background: None,
                 },
             ))
         }
@@ -430,7 +590,19 @@ fn composite(raw: &str, canvas: &Canvas, frame_time: Duration) -> Frames {
         vt.feed_str(FRAME_START);
         vt.feed_str(chunk);
 
-        let grid = canvas_cells(&vt, canvas.rows);
+        let mut grid = canvas_cells(&vt, canvas.rows);
+
+        // over the recording: blank cells show what's underneath
+        if let Some(bg) = &canvas.background {
+            for (line, under) in grid.iter_mut().zip(bg) {
+                for (cell, below) in line.iter_mut().zip(under) {
+                    if is_blank(cell) {
+                        *cell = *below;
+                    }
+                }
+            }
+        }
+
         let mut out = cell_diff(prev.as_deref(), &grid, canvas.col, canvas.row);
 
         if prev.is_none() {
@@ -449,6 +621,13 @@ fn composite(raw: &str, canvas: &Canvas, frame_time: Duration) -> Frames {
     }
 
     events
+}
+
+/// A cell the tool left empty: a space with no colors of its own.
+fn is_blank(cell: &avt::Cell) -> bool {
+    let pen = cell.pen();
+
+    cell.char() == ' ' && pen.background().is_none() && !pen.is_inverse()
 }
 
 /// The canvas rows of the virtual terminal (the spare row is dropped).
@@ -823,6 +1002,7 @@ mod tests {
             rows,
             anchor_text: "nw",
             clear: false,
+            background: None,
         }
     }
 
@@ -867,6 +1047,103 @@ mod tests {
 
         let events = composite(&raw, &c, FT60);
         assert!(events[0].1.starts_with("\x1b[?25l\x1b[H\x1b[2J"));
+    }
+
+    #[test]
+    fn over_the_recording_blank_cells_show_through() {
+        let raw = fake_tool_output(6, &[&["  hi  "], &["      "]]);
+        let base = vt_with(10, 2, "abcdefghij\r\nsecond");
+        let spec = FxSpec {
+            effect: "x".to_owned(),
+            source: FxSource::Text {
+                text: "hi".to_owned(),
+                anchor: Anchor::C,
+                area: Some(Area {
+                    col: 2,
+                    row: 0,
+                    cols: 6,
+                    rows: 1,
+                }),
+                over: true,
+            },
+            args: vec![],
+            speed: 1.0,
+            duration: None,
+            seed: 1,
+            keep_colors: false,
+        };
+
+        let (_, c) = layout(&spec, &base).unwrap();
+        assert!(!c.clear, "over the recording: no clearing");
+        assert_eq!((c.col, c.row, c.cols, c.rows), (2, 0, 6, 1));
+
+        let events = composite(&raw, &c, FT60);
+
+        // first frame: the text, with the recording around it
+        let first = screen_after(&base, &events[..1]);
+        assert_eq!(first[0], "abcdhighij");
+        assert_eq!(first[1], "second");
+
+        // the text going away reveals the recording again
+        let after = screen_after(&base, &events);
+        assert_eq!(after[0], "abcdefghij");
+    }
+
+    #[test]
+    fn typed_text_position_and_box() {
+        let base = vt_with(20, 6, "");
+        let mut spec = FxSpec {
+            effect: "x".to_owned(),
+            source: FxSource::text("hi"),
+            args: vec![],
+            speed: 1.0,
+            duration: None,
+            seed: 1,
+            keep_colors: false,
+        };
+
+        let (_, c) = layout(&spec, &base).unwrap();
+        assert_eq!((c.cols, c.rows, c.anchor_text, c.clear), (20, 6, "c", true));
+
+        spec.source = FxSource::Text {
+            text: "hi".to_owned(),
+            anchor: Anchor::Se,
+            area: Some(Area {
+                col: 4,
+                row: 1,
+                cols: 10,
+                rows: 3,
+            }),
+            over: false,
+        };
+        let (_, c) = layout(&spec, &base).unwrap();
+        assert_eq!(
+            (c.col, c.row, c.cols, c.rows, c.anchor_text),
+            (4, 1, 10, 3, "se")
+        );
+        assert!(c.background.is_none());
+
+        // a box off the screen is rejected
+        spec.source = FxSource::Text {
+            text: "hi".to_owned(),
+            anchor: Anchor::C,
+            area: Some(Area {
+                col: 15,
+                row: 0,
+                cols: 10,
+                rows: 1,
+            }),
+            over: false,
+        };
+        assert!(layout(&spec, &base).is_err());
+
+        // older edit files (just the text) still load, centered and clearing
+        let old: FxSource = serde_json::from_str(r#"{"kind":"text","text":"hi"}"#).unwrap();
+        assert_eq!(old, FxSource::text("hi"));
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"kind":"text","text":"hi"}"#
+        );
     }
 
     #[test]
