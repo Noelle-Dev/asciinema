@@ -78,6 +78,11 @@ impl Timeline {
         delay_in(&self.times, i)
     }
 
+    /// Delay before event `i` in the original, unedited recording.
+    pub fn original_delay(&self, i: usize) -> Option<Duration> {
+        delay_in(&self.original_times, i)
+    }
+
     /// Whether the delay before event `i` differs from the original recording.
     pub fn is_retimed(&self, i: usize) -> bool {
         delay_in(&self.times, i) != delay_in(&self.original_times, i)
@@ -86,6 +91,11 @@ impl Timeline {
     /// Total duration as currently edited.
     pub fn duration(&self) -> Duration {
         self.times.last().copied().unwrap_or_default()
+    }
+
+    /// Total duration of the original, unedited recording.
+    pub fn original_duration(&self) -> Duration {
+        self.original_times.last().copied().unwrap_or_default()
     }
 
     /// Recomputes event times from the original recording plus `edits`.
@@ -123,12 +133,22 @@ impl Timeline {
         self.vt_at_position(self.position_at(t))
     }
 
-    /// Consumes the timeline, producing events with edited times.
-    pub fn into_events(self) -> impl Iterator<Item = Event> {
-        self.events
-            .into_iter()
-            .zip(self.times)
-            .map(|(e, time)| Event { time, data: e.data })
+    /// Applies `events[from..to]` to `vt`, which must hold the state at
+    /// position `from`. Lets callers step forward without a full seek.
+    pub fn advance(&self, vt: &mut Vt, from: usize, to: usize) {
+        let to = to.min(self.events.len());
+
+        for event in &self.events[from.min(to)..to] {
+            feed(vt, &event.data);
+        }
+    }
+
+    /// Events with their edited times.
+    pub fn edited_events(&self) -> impl Iterator<Item = Event> + '_ {
+        self.events.iter().zip(&self.times).map(|(e, &time)| Event {
+            time,
+            data: e.data.clone(),
+        })
     }
 }
 
@@ -329,7 +349,7 @@ mod tests {
         assert_eq!(tl.delay(2), Some(Duration::from_secs(1)));
         assert_eq!(tl.vt_at(Duration::from_secs(5)).text()[0].trim_end(), "abc");
 
-        let times: Vec<_> = tl.into_events().map(|e| e.time.as_secs()).collect();
+        let times: Vec<_> = tl.edited_events().map(|e| e.time.as_secs()).collect();
         assert_eq!(times, [1, 2, 3]);
     }
 

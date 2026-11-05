@@ -43,6 +43,8 @@ async-trait = "0.1"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 bytes = "1.11"
 zstd = "0.13.3"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [build-dependencies]
 clap = { version = "4.0", features = ["derive", "wrap_help"] }

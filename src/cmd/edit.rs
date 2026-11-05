@@ -1,15 +1,12 @@
-use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 
-use crate::asciicast::{self, Asciicast, EventData, Version};
+use crate::asciicast::{self, EventData};
 use crate::cli;
-use crate::edit::{Edit, EditList, Timeline};
-use crate::encoder::{AsciicastV3Encoder, EncoderExt};
-use crate::output_writer;
+use crate::edit::{render, tui, Edit, EditList, Timeline};
 use crate::status;
 
 impl cli::Edit {
@@ -48,9 +45,31 @@ impl cli::Edit {
         }
 
         if let Some(output) = &self.render {
-            self.render(timeline, &path, output)?;
-        } else if !changed && !self.list && self.frame.is_none() {
-            print_summary(&timeline, &edits, &edits_path);
+            self.render(&timeline, &path, output)?;
+        }
+
+        if self.render_in_place {
+            warn_idle_time_limit(&timeline);
+            let backup = render::render_in_place(&timeline, &path, &edits_path)?;
+            status::info!(
+                "Rendered edits into {} (previous version kept as {})",
+                path.display(),
+                backup.display()
+            );
+        }
+
+        let did_something = changed
+            || self.list
+            || self.frame.is_some()
+            || self.render.is_some()
+            || self.render_in_place;
+
+        if !did_something {
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                tui::run(path, edits_path, timeline, edits)?;
+            } else {
+                print_summary(&timeline, &edits, &edits_path);
+            }
         }
 
         Ok(())
@@ -98,80 +117,28 @@ impl cli::Edit {
         Ok(changed)
     }
 
-    fn render(&self, timeline: Timeline, input: &Path, output: &str) -> Result<()> {
-        let to_stdout = output == "-";
-        let output_path = if to_stdout { "/dev/stdout" } else { output };
+    fn render(&self, timeline: &Timeline, input: &Path, output: &str) -> Result<()> {
+        warn_idle_time_limit(timeline);
 
-        if !to_stdout {
-            let out = Path::new(output);
+        if output == "-" {
+            let mut stdout = io::stdout().lock();
+            render::write(timeline, &mut stdout)?;
 
-            if out.exists() {
-                if same_file(input, out) {
-                    bail!(
-                        "refusing to render over the source recording; choose another output path"
-                    );
-                }
-
-                if !self.overwrite && fs::metadata(out)?.len() > 0 {
-                    bail!("file exists, use --overwrite option to overwrite the file");
-                }
-            }
+            return Ok(stdout.flush()?);
         }
 
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(output_path)
-            .with_context(|| format!("can't open {output}"))?;
-
-        let mut writer = output_writer::new(file, output.to_lowercase().ends_with(".zst"))?;
-
-        if !to_stdout && timeline.header.idle_time_limit.is_some() {
-            status::warning!(
-                "The recording's idle_time_limit header is kept; players will still cap pauses at it"
-            );
-        }
-
-        let header = clone_header(&timeline.header);
-        let events = timeline.into_events().map(Ok);
-
-        let cast = Asciicast {
-            version: Version::Three,
-            header,
-            events: Box::new(events),
-        };
-
-        AsciicastV3Encoder::new(false).encode_to_writer(cast, writer.as_mut())?;
-        writer.finish()?;
-
-        if !to_stdout {
-            status::info!("Rendered edited recording to {output}");
-        }
+        render::render_to_path(timeline, input, Path::new(output), self.overwrite)?;
+        status::info!("Rendered edited recording to {output}");
 
         Ok(())
     }
 }
 
-fn clone_header(h: &asciicast::Header) -> asciicast::Header {
-    asciicast::Header {
-        term_cols: h.term_cols,
-        term_rows: h.term_rows,
-        term_type: h.term_type.clone(),
-        term_version: h.term_version.clone(),
-        term_theme: h.term_theme.clone(),
-        timestamp: h.timestamp,
-        idle_time_limit: h.idle_time_limit,
-        command: h.command.clone(),
-        title: h.title.clone(),
-        env: h.env.clone(),
-    }
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+fn warn_idle_time_limit(timeline: &Timeline) {
+    if timeline.header.idle_time_limit.is_some() {
+        status::warning!(
+            "The recording's idle_time_limit header is kept; players will still cap pauses at it"
+        );
     }
 }
 
@@ -295,7 +262,7 @@ fn fmt_secs(d: Duration) -> String {
     format!("{:.3}s", d.as_secs_f64())
 }
 
-fn describe(edit: &Edit) -> String {
+pub(crate) fn describe(edit: &Edit) -> String {
     match *edit {
         Edit::SetDelay { event, secs } => format!("set delay of event {event} to {secs}s"),
         Edit::Scale { from, to, factor } => {
@@ -442,6 +409,7 @@ mod tests {
             cap_idle: vec![],
             undo: false,
             render: None,
+            render_in_place: false,
             overwrite: false,
         }
     }

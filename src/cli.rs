@@ -218,6 +218,8 @@ pub enum Commands {
 
     /// Edit a recording non-destructively.
     ///
+    /// Without any options, opens the interactive editor (press ? in it for help).
+    ///
     /// Edits are stored in a sidecar edit list next to the recording (by default <FILE>.edits.json) and never modify the original file. Use --render to produce a new recording with all edits applied.
     ///
     /// Events are addressed by index (see --list). The delay of event N is the time between event N-1 and event N. Ranges are inclusive and written FROM..TO.
@@ -225,6 +227,9 @@ pub enum Commands {
         about = "Edit a recording (timing, scrubbing)",
         long_about,
         after_help = "\x1b[1;4mExamples\x1b[0m:
+
+  asciinema edit demo.cast
+      Opens the interactive editor
 
   asciinema edit demo.cast --list
       Lists events with their index, time and delay
@@ -245,7 +250,10 @@ pub enum Commands {
       Removes the most recent edit
 
   asciinema edit demo.cast --render edited.cast
-      Writes a new recording with all edits applied"
+      Writes a new recording with all edits applied
+
+  asciinema edit demo.cast --render-in-place
+      Applies the edits to demo.cast itself, keeping demo.cast.bak"
     )]
     Edit(Edit),
 }
@@ -716,6 +724,10 @@ pub struct Edit {
         long_help
     )]
     pub render: Option<String>,
+
+    /// Replace the recording itself with the edited version and delete the edit list. The previous version of the recording is kept as <FILE>.bak (replacing any older backup).
+    #[arg(long, help = "Render edits into the recording itself", long_help)]
+    pub render_in_place: bool,
 
     /// Overwrite the --render output file if it already exists.
     #[arg(

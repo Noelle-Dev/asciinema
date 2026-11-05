@@ -6,8 +6,10 @@
 //! the interactive editor and the `--render` path share one implementation.
 
 pub mod edits;
+pub mod render;
 pub mod retime;
 pub mod timeline;
+pub mod tui;
 
 pub use edits::{Edit, EditList};
 pub use timeline::Timeline;

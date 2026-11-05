@@ -31,6 +31,7 @@ pub enum Version {
     Three,
 }
 
+#[derive(Clone)]
 pub struct Header {
     pub term_cols: u16,
     pub term_rows: u16,
