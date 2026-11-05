@@ -212,6 +212,7 @@ fn make_header(metadata: &Metadata) -> asciicast::Header {
         term_type: metadata.term.type_.clone(),
         term_version: metadata.term.version.clone(),
         term_theme: metadata.term.theme.clone(),
+        term_cursor: None,
         timestamp,
         idle_time_limit: metadata.idle_time_limit,
         command: metadata.command.clone(),

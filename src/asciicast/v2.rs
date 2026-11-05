@@ -95,6 +95,7 @@ impl Parser {
             term_type,
             term_version: None,
             term_theme,
+            term_cursor: None,
             timestamp: self.0.timestamp,
             idle_time_limit: self.0.idle_time_limit,
             command: self.0.command.clone(),

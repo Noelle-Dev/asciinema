@@ -246,6 +246,9 @@ pub enum Commands {
   asciinema edit demo.cast --cap-idle 0..999=1.5
       Caps every pause in events 0 to 999 at 1.5s
 
+  asciinema edit demo.cast --cursor block
+      Plays the recording back with a steady block cursor
+
   asciinema edit demo.cast --undo
       Removes the most recent edit
 
@@ -711,6 +714,16 @@ pub struct Edit {
         long_help
     )]
     pub cap_idle: Vec<String>,
+
+    /// Store a cursor shape in the recording's header. When the recording is played back with asciinema, the terminal's cursor is switched to this shape for the duration of playback and restored to the terminal's default afterwards. Use 'default' to remove the setting. Takes effect when rendering.
+    #[arg(
+        long,
+        value_name = "SHAPE",
+        value_parser = ["default", "block", "blinking-block", "underline", "blinking-underline", "bar", "blinking-bar"],
+        help = "Cursor shape to use during playback",
+        long_help
+    )]
+    pub cursor: Option<String>,
 
     /// Remove the most recent edit from the edit list. Applied before any new edits given in the same invocation.
     #[arg(long, help = "Remove the most recent edit", long_help)]

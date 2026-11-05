@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{util, Asciicast, Event, EventData, Header, Version};
+use super::{util, Asciicast, CursorShape, Event, EventData, Header, Version};
 use crate::tty::TtyTheme;
 use crate::util::Quantizer;
 
@@ -29,6 +29,9 @@ struct V3Term {
     type_: Option<String>,
     version: Option<String>,
     theme: Option<V3Theme>,
+    /// Non-standard extension. Kept as a string so unknown values from newer
+    /// writers are ignored instead of failing to parse the whole file.
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -97,6 +100,12 @@ impl Parser {
             term_type: self.header.term.type_.clone(),
             term_version: self.header.term.version.clone(),
             term_theme,
+            term_cursor: self
+                .header
+                .term
+                .cursor
+                .as_deref()
+                .and_then(CursorShape::from_name),
             timestamp: self.header.timestamp,
             idle_time_limit: self.header.idle_time_limit,
             command: self.header.command.clone(),
@@ -328,6 +337,10 @@ impl serde::Serialize for V3Term {
             len += 1;
         }
 
+        if self.cursor.is_some() {
+            len += 1;
+        }
+
         let mut map = serializer.serialize_map(Some(len))?;
         map.serialize_entry("cols", &self.cols)?;
         map.serialize_entry("rows", &self.rows)?;
@@ -342,6 +355,10 @@ impl serde::Serialize for V3Term {
 
         if let Some(theme) = &self.theme {
             map.serialize_entry("theme", &theme)?;
+        }
+
+        if let Some(cursor) = &self.cursor {
+            map.serialize_entry("cursor", &cursor)?;
         }
 
         map.end()
@@ -426,6 +443,7 @@ impl From<&Header> for V3Header {
                 type_: header.term_type.clone(),
                 version: header.term_version.clone(),
                 theme: header.term_theme.as_ref().map(|t| t.into()),
+                cursor: header.term_cursor.map(|c| c.name().to_owned()),
             },
             timestamp: header.timestamp,
             idle_time_limit: header.idle_time_limit,

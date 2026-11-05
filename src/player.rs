@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant};
 
-use crate::asciicast::{self, Event, EventData};
+use crate::asciicast::{self, CursorShape, Event, EventData};
 use crate::config::Key;
 use crate::tty::{DevTty, RawTty};
 
@@ -32,6 +32,41 @@ pub async fn play(
     keys: &KeyBindings,
     auto_resize: bool,
 ) -> Result<bool> {
+    let mut tty = DevTty::open().await?;
+    let cursor = recording.header.term_cursor;
+
+    if let Some(shape) = cursor {
+        tty.write_all(shape.escape_sequence().as_bytes()).await?;
+    }
+
+    let result = play_on(
+        &mut tty,
+        recording,
+        speed,
+        idle_time_limit_override,
+        pause_on_markers,
+        keys,
+        auto_resize,
+    )
+    .await;
+
+    // Restore the cursor however playback ended: finished, quit or error.
+    if cursor.is_some() {
+        let _ = tty.write_all(CursorShape::RESET_SEQUENCE.as_bytes()).await;
+    }
+
+    result
+}
+
+async fn play_on(
+    tty: &mut DevTty,
+    recording: asciicast::Asciicast<'static>,
+    speed: f64,
+    idle_time_limit_override: Option<f64>,
+    pause_on_markers: bool,
+    keys: &KeyBindings,
+    auto_resize: bool,
+) -> Result<bool> {
     let initial_cols = recording.header.term_cols;
     let initial_rows = recording.header.term_rows;
     let mut events = emit_session_events(recording, speed, idle_time_limit_override)?;
@@ -39,7 +74,6 @@ pub async fn play(
     let mut pause_elapsed_time: Option<u64> = None;
     let mut next_event = events.recv().await.transpose()?;
     let mut input = [0u8; 1024];
-    let mut tty = DevTty::open().await?;
 
     if auto_resize {
         tty.resize((initial_cols as usize, initial_rows as usize).into())

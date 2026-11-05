@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::asciicast::{self, EventData};
+use crate::asciicast::{self, CursorShape, EventData};
 use crate::cli;
 use crate::edit::{render, tui, Edit, EditList, Timeline};
 use crate::status;
@@ -100,14 +100,15 @@ impl cli::Edit {
             }))
             .chain(self.cap_idle.iter().map(|s| {
                 parse_range_op(s, n).map(|(from, to, max)| Edit::CapIdle { from, to, max })
-            }));
+            }))
+            .chain(self.cursor.as_deref().map(parse_cursor));
 
         for edit in new_edits {
             let edit = edit?;
             let description = describe(&edit);
 
             if edits.push(edit)? {
-                status::info!("Replaced earlier delay of the same event: {description}");
+                status::info!("Replaced an earlier edit of the same kind: {description}");
             } else {
                 status::info!("Added {description}");
             }
@@ -269,7 +270,21 @@ pub(crate) fn describe(edit: &Edit) -> String {
             format!("scale delays of events {from}..{to} by {factor}")
         }
         Edit::CapIdle { from, to, max } => format!("cap delays of events {from}..{to} at {max}s"),
+        Edit::SetCursor { shape: Some(s) } => format!("set cursor shape to {}", s.name()),
+        Edit::SetCursor { shape: None } => "use the terminal's default cursor shape".to_owned(),
     }
+}
+
+/// Parses a cursor shape name, or `default` to remove it.
+fn parse_cursor(name: &str) -> Result<Edit> {
+    let shape = match name {
+        "default" => None,
+        name => Some(
+            CursorShape::from_name(name).ok_or_else(|| anyhow!("unknown cursor shape '{name}'"))?,
+        ),
+    };
+
+    Ok(Edit::SetCursor { shape })
 }
 
 /// Parses `EVENT=SECS`.
@@ -410,6 +425,7 @@ mod tests {
             undo: false,
             render: None,
             render_in_place: false,
+            cursor: None,
             overwrite: false,
         }
     }

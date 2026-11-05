@@ -52,6 +52,7 @@ pub fn load(json: String) -> Result<Asciicast<'static>> {
         term_type,
         term_version: None,
         term_theme: None,
+        term_cursor: None,
         timestamp: None,
         idle_time_limit: None,
         command: asciicast.command.clone(),

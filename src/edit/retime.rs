@@ -69,6 +69,9 @@ pub fn apply(original_times: &[Duration], edits: &[Edit]) -> Vec<Duration> {
                     *d = (*d).min(max);
                 }
             }
+
+            // not a timing edit
+            Edit::SetCursor { .. } => {}
         }
     }
 

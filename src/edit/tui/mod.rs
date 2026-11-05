@@ -147,6 +147,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         // view
         KeyCode::Char('t') => app.toggle_mode(),
+        KeyCode::Char('C') => app.cycle_cursor(),
         KeyCode::Char('(') => app.zoom_by(2.0),
         KeyCode::Char(')') => app.zoom_by(0.5),
         KeyCode::Char('f') => app.fullscreen = !app.fullscreen,

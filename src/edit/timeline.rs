@@ -14,8 +14,8 @@ use std::time::Duration;
 use anyhow::Result;
 use avt::Vt;
 
-use super::{retime, EditList};
-use crate::asciicast::{Asciicast, Event, EventData, Header};
+use super::{retime, Edit, EditList};
+use crate::asciicast::{Asciicast, CursorShape, Event, EventData, Header};
 
 /// Take a keyframe after at least this many bytes of output since the last one...
 const KEYFRAME_BYTES: usize = 16 * 1024;
@@ -27,6 +27,7 @@ pub struct Timeline {
     pub header: Header,
     events: Vec<Event>,
     original_times: Vec<Duration>,
+    original_cursor: Option<CursorShape>,
     times: Vec<Duration>,
     keyframes: Vec<Keyframe>,
 }
@@ -51,6 +52,7 @@ impl Timeline {
         let keyframes = build_keyframes(&header, &events);
 
         Self {
+            original_cursor: header.term_cursor,
             header,
             times: original_times.clone(),
             original_times,
@@ -101,6 +103,16 @@ impl Timeline {
     /// Recomputes event times from the original recording plus `edits`.
     pub fn apply_edits(&mut self, edits: &EditList) {
         self.times = retime::apply(&self.original_times, &edits.edits);
+
+        self.header.term_cursor = edits
+            .edits
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Edit::SetCursor { shape } => Some(*shape),
+                _ => None,
+            })
+            .unwrap_or(self.original_cursor);
     }
 
     /// Number of events that have happened by time `t` (i.e. the index of the

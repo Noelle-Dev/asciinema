@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::app::{App, Drag, TimelineMode};
-use crate::asciicast::EventData;
+use crate::asciicast::{CursorShape, EventData};
 use crate::tty::TtyTheme;
 
 /// Rows inside the timeline box: ruler, bars, ticks, playhead/markers.
@@ -128,7 +128,13 @@ fn preview_title(app: &App, area: Rect) -> String {
         }
     };
 
-    format!(" {name} · {cols}×{rows}{view} ")
+    let cursor = app
+        .timeline
+        .header
+        .term_cursor
+        .map_or("default", CursorShape::name);
+
+    format!(" {name} · {cols}×{rows} · cursor: {cursor} (C){view} ")
 }
 
 fn mode_title(app: &App) -> Span<'static> {
@@ -154,6 +160,7 @@ fn draw_preview(buf: &mut Buffer, area: Rect, app: &App) {
         &vt,
         offset,
         app.timeline.header.term_theme.as_ref(),
+        app.timeline.header.term_cursor,
     );
 }
 
@@ -164,6 +171,7 @@ pub fn draw_screen(
     vt: &Vt,
     (ox, oy): (usize, usize),
     theme: Option<&TtyTheme>,
+    cursor_shape: Option<CursorShape>,
 ) {
     let default_fg = theme.map_or(Color::Reset, |t| rgb(t.fg));
     let default_bg = theme.map_or(Color::Reset, |t| rgb(t.bg));
@@ -206,8 +214,10 @@ pub fn draw_screen(
 
             let mut style = pen_style(c.pen(), theme, default_fg, default_bg);
 
+            let mut ch = ch;
+
             if cursor.visible && cursor.col == ox + x && cursor.row == oy + y {
-                style = style.add_modifier(Modifier::REVERSED);
+                (ch, style) = cursor_cell(ch, style, cursor_shape);
             }
 
             let pos = (area.x + x as u16, area.y + y as u16);
@@ -216,6 +226,27 @@ pub fn draw_screen(
                 cell.set_char(ch).set_style(style);
             }
         }
+    }
+}
+
+/// How the recorded cursor is drawn in the preview, approximating its shape.
+/// A terminal cell can't show a thin bar over a character, so a bar is drawn
+/// as `▏` on blank cells (the usual case: the end of a line being typed) and
+/// as a block otherwise.
+fn cursor_cell(ch: char, style: Style, shape: Option<CursorShape>) -> (char, Style) {
+    use CursorShape::*;
+
+    let blink = matches!(shape, Some(BlinkingBlock | BlinkingUnderline | BlinkingBar));
+    let style = if blink {
+        style.add_modifier(Modifier::SLOW_BLINK)
+    } else {
+        style
+    };
+
+    match shape {
+        Some(Underline | BlinkingUnderline) => (ch, style.add_modifier(Modifier::UNDERLINED)),
+        Some(Bar | BlinkingBar) if ch == ' ' => ('▏', style),
+        _ => (ch, style.add_modifier(Modifier::REVERSED)),
     }
 }
 
@@ -704,6 +735,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("drag elsewhere", "scrub"),
     ("View", ""),
     ("t", "switch time view / event view"),
+    ("C", "cycle the cursor shape stored in the recording"),
     ("( / ) or ctrl-wheel", "zoom timeline in / out (time view)"),
     ("h j k l / H J K L", "pan the preview (by 1 / by 10)"),
     ("0", "auto-scroll to the recorded cursor (undoes hjkl)"),
@@ -777,6 +809,31 @@ mod tests {
                 "help line for '{key}' is {len} > {inner} columns"
             );
         }
+    }
+
+    #[test]
+    fn cursor_shapes_in_preview() {
+        use ratatui::style::{Modifier, Style};
+
+        use super::cursor_cell;
+        use crate::asciicast::CursorShape::*;
+
+        let s = Style::default();
+        let has = |(_, st): (char, Style), m: Modifier| st.add_modifier.contains(m);
+
+        assert!(has(cursor_cell('a', s, None), Modifier::REVERSED));
+        assert!(has(cursor_cell('a', s, Some(Block)), Modifier::REVERSED));
+        assert!(!has(cursor_cell('a', s, Some(Block)), Modifier::SLOW_BLINK));
+        assert!(has(
+            cursor_cell('a', s, Some(BlinkingBlock)),
+            Modifier::SLOW_BLINK
+        ));
+        assert!(has(
+            cursor_cell('a', s, Some(Underline)),
+            Modifier::UNDERLINED
+        ));
+        assert_eq!(cursor_cell(' ', s, Some(Bar)).0, '▏');
+        assert!(has(cursor_cell('a', s, Some(Bar)), Modifier::REVERSED));
     }
 
     #[test]

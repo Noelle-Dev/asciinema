@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::asciicast::CursorShape;
+
 const FORMAT_VERSION: u32 = 1;
 
 /// A single edit operation.
@@ -25,6 +27,10 @@ pub enum Edit {
 
     /// Cap delays of events `from..=to` at `max` seconds.
     CapIdle { from: usize, to: usize, max: f64 },
+
+    /// Set the cursor shape stored in the recording's header (`None` removes
+    /// it, so playback uses the terminal's default).
+    SetCursor { shape: Option<CursorShape> },
 }
 
 /// An ordered list of edits for one recording. Edits are applied in order.
@@ -111,9 +117,15 @@ impl EditList {
         edit.validate(self.event_count)?;
         let len = self.edits.len();
 
-        if let Edit::SetDelay { event, .. } = edit {
-            self.edits
-                .retain(|e| !matches!(*e, Edit::SetDelay { event: other, .. } if other == event));
+        // Edits that set an absolute value make earlier ones of the same kind redundant.
+        match edit {
+            Edit::SetDelay { event, .. } => self
+                .edits
+                .retain(|e| !matches!(*e, Edit::SetDelay { event: other, .. } if other == event)),
+
+            Edit::SetCursor { .. } => self.edits.retain(|e| !matches!(e, Edit::SetCursor { .. })),
+
+            _ => {}
         }
 
         let replaced = self.edits.len() != len;
@@ -179,6 +191,8 @@ impl Edit {
                 check_range(from, to)?;
                 check_secs("idle cap", max)
             }
+
+            Edit::SetCursor { .. } => Ok(()),
         }
     }
 }
@@ -353,6 +367,48 @@ mod tests {
                     secs: 5.0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn set_cursor_json_and_coalescing() {
+        use crate::asciicast::CursorShape;
+
+        let mut list = EditList::new(3);
+        list.push(Edit::SetCursor {
+            shape: Some(CursorShape::Bar),
+        })
+        .unwrap();
+        list.push(Edit::SetDelay {
+            event: 1,
+            secs: 1.0,
+        })
+        .unwrap();
+        assert!(list
+            .push(Edit::SetCursor {
+                shape: Some(CursorShape::Block)
+            })
+            .unwrap());
+        list.push(Edit::SetCursor { shape: None }).unwrap();
+
+        assert_eq!(list.edits.len(), 2);
+
+        let json = serde_json::to_value(&list.edits).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"op": "set_delay", "event": 1, "secs": 1.0},
+                {"op": "set_cursor", "shape": null},
+            ])
+        );
+
+        let parsed: Edit =
+            serde_json::from_str(r#"{"op":"set_cursor","shape":"blinking-bar"}"#).unwrap();
+        assert_eq!(
+            parsed,
+            Edit::SetCursor {
+                shape: Some(CursorShape::BlinkingBar)
+            }
         );
     }
 

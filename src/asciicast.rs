@@ -38,11 +38,66 @@ pub struct Header {
     pub term_type: Option<String>,
     pub term_version: Option<String>,
     pub term_theme: Option<TtyTheme>,
+    /// Cursor shape to use when playing back; `None` keeps the terminal's default.
+    pub term_cursor: Option<CursorShape>,
     pub timestamp: Option<u64>,
     pub idle_time_limit: Option<f64>,
     pub command: Option<String>,
     pub title: Option<String>,
     pub env: Option<HashMap<String, String>>,
+}
+
+/// Terminal cursor shape, as set with the DECSCUSR escape sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CursorShape {
+    BlinkingBlock,
+    Block,
+    BlinkingUnderline,
+    Underline,
+    BlinkingBar,
+    Bar,
+}
+
+impl CursorShape {
+    pub const ALL: [CursorShape; 6] = [
+        CursorShape::BlinkingBlock,
+        CursorShape::Block,
+        CursorShape::BlinkingUnderline,
+        CursorShape::Underline,
+        CursorShape::BlinkingBar,
+        CursorShape::Bar,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CursorShape::BlinkingBlock => "blinking-block",
+            CursorShape::Block => "block",
+            CursorShape::BlinkingUnderline => "blinking-underline",
+            CursorShape::Underline => "underline",
+            CursorShape::BlinkingBar => "blinking-bar",
+            CursorShape::Bar => "bar",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// Escape sequence that sets this shape.
+    pub fn escape_sequence(self) -> &'static str {
+        match self {
+            CursorShape::BlinkingBlock => "\x1b[1 q",
+            CursorShape::Block => "\x1b[2 q",
+            CursorShape::BlinkingUnderline => "\x1b[3 q",
+            CursorShape::Underline => "\x1b[4 q",
+            CursorShape::BlinkingBar => "\x1b[5 q",
+            CursorShape::Bar => "\x1b[6 q",
+        }
+    }
+
+    /// Escape sequence that restores the terminal's default (configured) shape.
+    pub const RESET_SEQUENCE: &'static str = "\x1b[0 q";
 }
 
 #[derive(Clone)]
@@ -93,6 +148,7 @@ impl Default for Header {
             term_type: None,
             term_version: None,
             term_theme: None,
+            term_cursor: None,
             timestamp: None,
             idle_time_limit: None,
             command: None,
@@ -631,5 +687,37 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn v3_cursor_shape_round_trip() {
+        use super::{CursorShape, V3Encoder};
+
+        let header = Header {
+            term_cursor: Some(CursorShape::BlinkingBar),
+            ..Default::default()
+        };
+
+        let line = String::from_utf8(V3Encoder::new().header(&header)).unwrap();
+        assert!(line.contains(r#""cursor":"blinking-bar""#), "{line}");
+
+        let cast = super::open(line.as_bytes()).unwrap();
+        assert_eq!(cast.header.term_cursor, Some(CursorShape::BlinkingBar));
+
+        // absent by default, and not written
+        let line = String::from_utf8(V3Encoder::new().header(&Header::default())).unwrap();
+        assert!(!line.contains("cursor"));
+        assert_eq!(
+            super::open(line.as_bytes()).unwrap().header.term_cursor,
+            None
+        );
+    }
+
+    #[test]
+    fn v3_unknown_cursor_shape_is_ignored() {
+        let line = r#"{"version":3,"term":{"cols":80,"rows":24,"cursor":"sparkly"}}"#;
+        let cast = super::open(line.as_bytes()).unwrap();
+
+        assert_eq!(cast.header.term_cursor, None);
     }
 }
