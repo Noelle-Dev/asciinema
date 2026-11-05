@@ -252,6 +252,12 @@ pub enum Commands {
   asciinema edit demo.cast --insert-text '0=3:My demo\\nPart 1'
       Opens with a 3-second title card
 
+  asciinema edit demo.cast --insert-effect 0=decrypt --fx-text 'Hello'
+      Opens with \"Hello\" decrypting on a cleared screen
+
+  asciinema edit demo.cast --insert-effect 30=rain --fx-region 0,2,40x3
+      Rains in the 40x3 region at the screen's third row, before event 30
+
   asciinema edit demo.cast --cursor block
       Plays the recording back with a steady block cursor
 
@@ -780,6 +786,111 @@ pub struct Edit {
         long_help
     )]
     pub insert_cast: Vec<String>,
+
+    /// Insert a text effect before event AT, captured with ttfx or tte (whichever is installed; ASCIINEMA_FX_TOOL can name one). Animate typed text (--fx-text), part of the screen (--fx-region) or the whole screen (--fx-screen). See --fx-list for effects and --fx-options for an effect's options.
+    #[arg(
+        long,
+        value_name = "AT=EFFECT",
+        help = "Insert a text effect",
+        long_help
+    )]
+    pub insert_effect: Option<String>,
+
+    /// Play a text effect instead of events FROM..TO: they're cut, the effect animates the screen as it looked after them, and ends on that screen. Takes the same --fx-* options as --insert-effect.
+    #[arg(
+        long,
+        value_name = "FROM..TO=EFFECT",
+        help = "Replace events with a text effect",
+        long_help
+    )]
+    pub replace_effect: Option<String>,
+
+    /// Text for --insert-effect, centered on a cleared screen. Use \n for a new line.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Effect: animate this text",
+        long_help
+    )]
+    pub fx_text: Option<String>,
+
+    /// Part of the screen for --insert-effect to animate in place, as COL,ROW,COLSxROWS (0-based), e.g. 0,2,40x3.
+    #[arg(
+        long,
+        value_name = "COL,ROW,COLSxROWS",
+        help = "Effect: animate this part of the screen",
+        long_help
+    )]
+    pub fx_region: Option<String>,
+
+    /// Make --insert-effect animate the whole screen at that point, in place.
+    #[arg(long, help = "Effect: animate the whole screen", long_help)]
+    pub fx_screen: bool,
+
+    /// Effect speed multiplier (2 is twice as fast).
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        default_value_t = 1.0,
+        help = "Effect speed",
+        long_help
+    )]
+    pub fx_speed: f64,
+
+    /// Fit the effect to this many seconds; the speed is worked out to match (overrides --fx-speed).
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Effect: run for this long",
+        long_help
+    )]
+    pub fx_duration: Option<f64>,
+
+    /// Seed for the effect's randomness. The same seed gives the same animation.
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Effect seed [default: random]",
+        long_help
+    )]
+    pub fx_seed: Option<u64>,
+
+    /// How long the effect's last frame stays up before the recording continues.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 1.0,
+        help = "Effect: hold the last frame",
+        long_help
+    )]
+    pub fx_hold: f64,
+
+    /// Let the effect use the screen's own colors (for --fx-region / --fx-screen).
+    #[arg(long, help = "Effect: keep the screen's colors", long_help)]
+    pub fx_keep_colors: bool,
+
+    /// An option passed to the effect, e.g. --fx-arg=--typing-speed --fx-arg=4. Can be given multiple times.
+    #[arg(
+        long,
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        help = "Effect: pass an option through",
+        long_help
+    )]
+    pub fx_arg: Vec<String>,
+
+    /// List the available effects and exit.
+    #[arg(long, help = "List available effects", long_help)]
+    pub fx_list: bool,
+
+    /// Show all options of an effect and exit.
+    #[arg(
+        long,
+        value_name = "EFFECT",
+        help = "Show an effect's options",
+        long_help
+    )]
+    pub fx_options: Option<String>,
 
     /// Copy events FROM..TO of this recording and insert the copy right after them.
     #[arg(

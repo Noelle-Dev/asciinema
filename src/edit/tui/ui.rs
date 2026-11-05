@@ -62,7 +62,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
 
     // The metadata panel sits beside the preview so changes are visible live;
     // on narrow terminals it takes the preview's place.
-    let (preview_box, meta_box) = if app.meta.is_some() {
+    let (preview_box, meta_box) = if app.meta.is_some() || app.fx.is_some() {
         if preview_box.width >= super::meta::PANEL_WIDTH + 24 {
             let [p, m] = Layout::horizontal([
                 Constraint::Min(20),
@@ -120,7 +120,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     };
 
     let meta = meta_box.map_or(Rect::default(), |m| {
-        super::meta::draw(frame.buffer_mut(), m, app)
+        if app.fx.is_some() {
+            super::fxpanel::draw(frame.buffer_mut(), m, app)
+        } else {
+            super::meta::draw(frame.buffer_mut(), m, app)
+        }
     });
 
     Areas {
@@ -181,15 +185,32 @@ fn draw_preview(buf: &mut Buffer, area: Rect, app: &App) {
 
     let (w, h) = (area.width as usize, area.height as usize);
     let offset = app.viewport_offset(w, h);
-    let vt = app.vt();
-    draw_screen(
-        buf,
-        area,
-        &vt,
-        offset,
-        app.timeline.header.term_theme.as_ref(),
-        app.timeline.header.term_cursor,
-    );
+    let theme = app.timeline.header.term_theme.as_ref();
+    let cursor = app.timeline.header.term_cursor;
+
+    // an effect being previewed plays over the frozen screen
+    match super::fxpanel::preview_screen(app) {
+        Some(vt) => draw_screen(buf, area, &vt, offset, theme, cursor),
+        None => draw_screen(buf, area, &app.vt(), offset, theme, cursor),
+    }
+
+    // the region being chosen for an effect
+    if let Some((col, row, cols, rows)) = super::fxpanel::highlighted_region(app) {
+        for y in row..row + rows {
+            for x in col..col + cols {
+                let (Some(sx), Some(sy)) = (x.checked_sub(offset.0), y.checked_sub(offset.1))
+                else {
+                    continue;
+                };
+
+                if sx < w && sy < h {
+                    if let Some(cell) = buf.cell_mut((area.x + sx as u16, area.y + sy as u16)) {
+                        cell.set_bg(SELECTION_BG);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Paints the recorded terminal's cells into `area`, starting at `offset`.
@@ -710,26 +731,36 @@ fn status_line(app: &App) -> Line<'static> {
             format!("dragging #{event}: {original_delay:.3}s → {new_delay:.3}s"),
             Style::default().fg(ACCENT),
         ));
-    } else if let Some(Origin::Clip { insert }) = app.timeline.origin(app.position) {
+    } else if let Some(Origin::Clip { insert }) =
+        app.current_frame().and_then(|i| app.timeline.origin(i))
+    {
         spans.push(sep());
         spans.push(Span::styled(
             format!("in inserted clip #{insert} (d removes it)"),
             Style::default().fg(CLIP),
         ));
     } else if let Some(e) = app.target_event() {
-        let p = app.position;
-        let now = app.timeline.delay(p).unwrap_or_default();
-        let was = app.timeline.original_delay(p).unwrap_or_default();
+        let now = app.timeline.event_delay(e).unwrap_or_default();
+        let was = app.timeline.original_event_delay(e).unwrap_or_default();
         spans.push(sep());
 
-        if let Some(Origin::Cut { from, to }) = app.timeline.origin(p) {
+        // at a cut: before its jump, or on it
+        let cut = [Some(app.position), app.current_frame()]
+            .into_iter()
+            .flatten()
+            .find_map(|i| match app.timeline.origin(i) {
+                Some(Origin::Cut { from, to }) => Some((from, to)),
+                _ => None,
+            });
+
+        if let Some((from, to)) = cut {
             spans.push(Span::styled(
                 format!("✂ events {from}..{to} cut (D restores) "),
                 Style::default().fg(CUT),
             ));
         }
 
-        if app.timeline.is_retimed(p) {
+        if now != was {
             spans.push(Span::styled(
                 format!("pause before #{e}: {} → {} *", secs(was), secs(now)),
                 Style::default().fg(ACCENT),
@@ -739,12 +770,15 @@ fn status_line(app: &App) -> Line<'static> {
         }
     }
 
-    if let Some((a, b)) = app.selection() {
+    if let Some((lo, hi)) = app.selection() {
+        let what = match app.events_in(lo, hi) {
+            Some((a, b)) if a == b => format!("selected event {a}"),
+            Some((a, b)) => format!("selected events {a}..{b}"),
+            None => "selected clip".to_owned(),
+        };
+
         spans.push(sep());
-        spans.push(Span::styled(
-            format!("selected {a}..{b}"),
-            Style::default().bg(SELECTION_BG),
-        ));
+        spans.push(Span::styled(what, Style::default().bg(SELECTION_BG)));
     }
 
     Line::from(spans)
@@ -760,6 +794,17 @@ fn help_line(app: &App) -> Line<'static> {
 
     // Messages temporarily replace the key hints, which are always in `?`.
     let message = app.message();
+
+    if let (Some(panel), None) = (&app.fx, message) {
+        let mut spans = Vec::new();
+
+        for (k, what) in super::fxpanel::hints(panel) {
+            spans.push(Span::styled(*k, Style::default().fg(PLAYHEAD)));
+            spans.push(Span::styled(format!(" {what}  "), Style::default().fg(DIM)));
+        }
+
+        return Line::from(spans);
+    }
 
     if let (Some(panel), None) = (&app.meta, message) {
         let mut spans = Vec::new();
@@ -790,6 +835,7 @@ fn help_line(app: &App) -> Line<'static> {
         ("u", "undo"),
         ("d", "cut"),
         ("i", "insert"),
+        ("x", "effect"),
         ("t", "view"),
         ("f", "full"),
         ("m", "metadata"),
@@ -835,6 +881,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("d / Delete", "cut selection (or the event/clip here)"),
     ("D", "restore a cut (✂), or part of it"),
     ("i", "insert: hold, blank, text, recording, copy"),
+    ("x", "insert a text effect (ttfx / tte)"),
     ("View", ""),
     ("t", "switch time view / event view"),
     ("m", "metadata: title, idle limit, colors, cursor…"),

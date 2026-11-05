@@ -78,7 +78,7 @@ pub fn apply(original_times: &[Duration], edits: &[Edit]) -> Vec<Duration> {
             | Edit::SetTheme { .. } => {}
 
             // structural edits are handled when the playlist is built
-            Edit::Delete { .. } | Edit::Insert { .. } => {}
+            Edit::Delete { .. } | Edit::Insert { .. } | Edit::Replace { .. } => {}
         }
     }
 

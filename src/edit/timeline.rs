@@ -186,24 +186,29 @@ impl Timeline {
 
     /// The original event whose (editable) delay comes before playlist item `i`.
     pub fn delay_owner(&self, i: usize) -> Option<usize> {
-        match &self.items.get(i)?.delay {
-            Delay::Of(e) => Some(*e),
-            Delay::Fixed(_) => None,
+        let item = self.items.get(i)?;
+
+        match (&item.delay, item.origin) {
+            (Delay::Of(e), _) => Some(*e),
+            // an event right after a cut's jump: its pause is the jump's
+            (Delay::Fixed(_), Origin::Event(e)) => Some(e),
+            (Delay::Fixed(_), _) => None,
         }
+    }
+
+    /// Edited pause before original event `e`.
+    pub fn event_delay(&self, e: usize) -> Option<Duration> {
+        self.delays.get(e).copied()
+    }
+
+    /// Pause before original event `e` in the unedited recording.
+    pub fn original_event_delay(&self, e: usize) -> Option<Duration> {
+        delay_in(&self.original_times, e)
     }
 
     /// Current (edited) delay before playlist item `i`.
     pub fn delay(&self, i: usize) -> Option<Duration> {
         delay_in(&self.times, i)
-    }
-
-    /// Delay before playlist item `i` in the unedited recording (for clips,
-    /// their own delay).
-    pub fn original_delay(&self, i: usize) -> Option<Duration> {
-        match self.delay_owner(i) {
-            Some(e) => delay_in(&self.original_times, e),
-            None => self.delay(i),
-        }
     }
 
     /// Whether the delay before playlist item `i` was retimed.
@@ -233,7 +238,12 @@ impl Timeline {
         let structure: Vec<Edit> = edits
             .edits
             .iter()
-            .filter(|e| matches!(e, Edit::Delete { .. } | Edit::Insert { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Edit::Delete { .. } | Edit::Insert { .. } | Edit::Replace { .. }
+                )
+            })
             .cloned()
             .collect();
 
@@ -311,6 +321,12 @@ impl Timeline {
         }
     }
 
+    /// Screen of the original recording after `p` events.
+    pub fn original_vt_at(&self, p: usize) -> Vt {
+        self.original_keyframes
+            .vt_at(p.min(self.events.len()), |i| &self.events[i].data)
+    }
+
     /// Playlist events with their edited times.
     pub fn edited_events(&self) -> impl Iterator<Item = Event> + '_ {
         (0..self.items.len()).map(|i| Event {
@@ -324,7 +340,9 @@ impl Timeline {
     fn compile(&self, structure: &[Edit]) -> Result<Vec<Item>> {
         let n = self.events.len();
         let mut deleted = vec![false; n];
-        let mut inserts: Vec<Vec<(usize, &Clip)>> = vec![Vec::new(); n + 1];
+        let mut replaced = vec![false; n];
+        // clips by position: (clip number, clip, last replaced event if a replace)
+        let mut inserts: Vec<Vec<(usize, &Clip, Option<usize>)>> = vec![Vec::new(); n + 1];
         let mut insert_no = 0;
 
         for edit in structure {
@@ -336,7 +354,18 @@ impl Timeline {
                 }
 
                 Edit::Insert { at, clip } => {
-                    inserts[(*at).min(n)].push((insert_no, clip));
+                    inserts[(*at).min(n)].push((insert_no, clip, None));
+                    insert_no += 1;
+                }
+
+                Edit::Replace { from, to, clip } => {
+                    let to = (*to).min(n - 1);
+
+                    for r in replaced.iter_mut().take(to + 1).skip(*from) {
+                        *r = true;
+                    }
+
+                    inserts[*from].push((insert_no, clip, Some(to)));
                     insert_no += 1;
                 }
 
@@ -357,12 +386,20 @@ impl Timeline {
         let mut cut_from = None;
 
         for p in 0..=n {
-            for &(insert, clip) in &inserts[p] {
-                self.push_clip(&mut b, Origin::Clip { insert }, clip, showing)?;
+            for &(insert, clip, replaces) in &inserts[p] {
+                // a replace ends on the screen as it was after the replaced events
+                let restore_to = replaces.map_or(showing, |to| to + 1);
+                self.push_clip(&mut b, Origin::Clip { insert }, clip, showing, restore_to)?;
+                showing = restore_to;
             }
 
             if p == n {
                 break;
+            }
+
+            // replaced events are skipped; their clip already moved the screen on
+            if replaced[p] && !deleted[p] {
+                continue;
             }
 
             if deleted[p] {
@@ -412,16 +449,20 @@ impl Timeline {
         origin: Origin,
         clip: &Clip,
         showing: usize,
+        restore_to: usize,
     ) -> Result<()> {
         let empty = || ItemData::Owned(EventData::Output(String::new()));
         let secs = |s: f64| Duration::from_secs_f64(s);
         let fixed0 = || Delay::Fixed(Duration::ZERO);
 
         match clip {
-            // the screen doesn't change, so there's nothing to restore
+            // the screen doesn't change, so (unless replacing) there's nothing to restore
             Clip::Hold { secs: s } => {
                 b.push(empty(), Delay::Fixed(secs(*s)), origin);
-                return Ok(());
+
+                if restore_to == showing {
+                    return Ok(());
+                }
             }
 
             Clip::Blank { secs: s } => {
@@ -433,6 +474,33 @@ impl Timeline {
                 let card = format!("{REDRAW_PREFIX}{}", centered(text, b.size));
                 b.push(output(card), fixed0(), origin);
                 b.push(empty(), Delay::Fixed(secs(*s)), origin);
+            }
+
+            Clip::Effect { hold, cache, .. } => {
+                // the captured frames draw over the current screen
+                let source = self
+                    .source(cache)
+                    .context("the effect's captured frames are missing; recreate the effect")?;
+                let mut prev = Duration::ZERO;
+
+                for event in &source.events {
+                    if let EventData::Output(_) = event.data {
+                        let delay = event.time.saturating_sub(prev);
+                        prev = event.time;
+                        b.push(
+                            ItemData::Owned(event.data.clone()),
+                            Delay::Fixed(delay),
+                            origin,
+                        );
+                    }
+                }
+
+                let before = self
+                    .original_keyframes
+                    .vt_at(restore_to, |i| &self.events[i].data);
+                b.redraw(before, Delay::Fixed(secs(*hold)), origin);
+
+                return Ok(());
             }
 
             Clip::Recording { path, from, to } => {
@@ -495,17 +563,18 @@ impl Timeline {
 
                 let before = self
                     .original_keyframes
-                    .vt_at(showing, |i| &self.events[i].data);
+                    .vt_at(restore_to, |i| &self.events[i].data);
                 b.redraw(before, Delay::Fixed(tail), origin);
 
                 return Ok(());
             }
         }
 
-        // put back the screen as it was before the clip
+        // put back the screen as it was before the clip (or, replacing, after
+        // the replaced events)
         let before = self
             .original_keyframes
-            .vt_at(showing, |i| &self.events[i].data);
+            .vt_at(restore_to, |i| &self.events[i].data);
         b.redraw(before, fixed0(), origin);
 
         Ok(())
@@ -886,6 +955,17 @@ mod tests {
                         secs: 1.0,
                     },
                 },
+                Edit::Replace {
+                    from: 800,
+                    to: 900,
+                    clip: Clip::Blank { secs: 1.0 },
+                },
+                // spans an alt screen switch (at event 703)
+                Edit::Replace {
+                    from: 699,
+                    to: 702,
+                    clip: Clip::Hold { secs: 1.0 },
+                },
             ],
         );
 
@@ -943,6 +1023,63 @@ mod tests {
 
         // and it's the pause the redraw item reports as editable
         assert_eq!(tl.delay_owner(1), Some(3));
+    }
+
+    #[test]
+    fn replace_plays_the_clip_instead_and_ends_after_the_replaced_events() {
+        let mut tl = simple(&[(1, "a"), (2, "b"), (4, "c"), (5, "d")]);
+        apply(
+            &mut tl,
+            vec![Edit::Replace {
+                from: 1,
+                to: 2,
+                clip: Clip::Text {
+                    text: "X".to_owned(),
+                    secs: 1.0,
+                },
+            }],
+        );
+
+        assert_eq!(tl.position_of_event(1), None);
+        assert_eq!(tl.position_of_event(2), None);
+
+        // the card is up straight after "a" ...
+        assert_eq!(row(&tl.vt_at_position(2), 2), "         X");
+
+        // ... and the moment it ends, the screen is as after "c" - no flash
+        // of the screen from before the replaced events
+        let d = tl.position_of_event(3).unwrap();
+        assert_eq!(row(&tl.vt_at_position(d), 0), "abc");
+        for i in 2..d {
+            assert_ne!(
+                row(&tl.vt_at_position(i), 0),
+                "a",
+                "the old screen shows at {i}"
+            );
+        }
+        assert_eq!(row(&tl.vt_at_position(d + 1), 0), "abcd");
+
+        // a, card (1s), then d after its own 1s pause; b and c's time is gone
+        assert_eq!(tl.duration(), Duration::from_secs(3));
+
+        // a replace with a hold freezes, then moves on to after the events
+        let mut tl = simple(&[(1, "a"), (2, "b"), (3, "c")]);
+        apply(
+            &mut tl,
+            vec![Edit::Replace {
+                from: 1,
+                to: 1,
+                clip: Clip::Hold { secs: 2.0 },
+            }],
+        );
+
+        let c = tl.position_of_event(2).unwrap();
+        assert_eq!(row(&tl.vt_at_position(c), 0), "ab");
+        assert_eq!(
+            row(&tl.vt_at_position(2), 0),
+            "a",
+            "frozen on the screen before b"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use crate::asciicast::{self, CursorShape, EventData};
 use crate::cli;
 use crate::edit::timeline::Origin;
-use crate::edit::{render, tui, Clip, Edit, EditList, Timeline};
+use crate::edit::{fx, render, tui, Clip, Edit, EditList, Timeline};
 use crate::status;
 
 impl cli::Edit {
@@ -15,6 +15,10 @@ impl cli::Edit {
         if self.file.starts_with("http://") || self.file.starts_with("https://") || self.file == "-"
         {
             bail!("edit requires a local recording file (download it first)");
+        }
+
+        if self.fx_list || self.fx_options.is_some() {
+            return self.print_fx_help();
         }
 
         let path = PathBuf::from(&self.file);
@@ -28,7 +32,22 @@ impl cli::Edit {
         }
 
         let mut edits = EditList::load_or_new(&edits_path, timeline.original_len())?;
-        let changed = self.update_edits(&mut edits)?;
+        let mut changed = self.update_edits(&mut edits)?;
+
+        let effect = match (&self.insert_effect, &self.replace_effect) {
+            (Some(_), Some(_)) => bail!("use --insert-effect or --replace-effect, not both"),
+            (Some(a), None) => Some((a, false)),
+            (None, Some(a)) => Some((a, true)),
+            (None, None) => None,
+        };
+
+        if let Some((arg, replace)) = effect {
+            let edit = self.capture_effect(arg, replace, &timeline, &path)?;
+            let description = describe(&edit);
+            edits.push(edit)?;
+            status::info!("Added {description}");
+            changed = true;
+        }
 
         // build before saving, so an edit that can't be applied isn't kept
         timeline.apply_edits(&edits)?;
@@ -164,6 +183,98 @@ impl cli::Edit {
         Ok(changed)
     }
 
+    fn print_fx_help(&self) -> Result<()> {
+        let tool = fx::find_tool()?;
+
+        match &self.fx_options {
+            Some(effect) => {
+                let options = fx::effect_options(&tool, effect)?;
+
+                if options.is_empty() {
+                    bail!(
+                        "{} doesn't know an effect called '{effect}' (see --fx-list)",
+                        tool.name()
+                    );
+                }
+
+                for o in options {
+                    let value = if o.takes_value { " <value>" } else { "" };
+
+                    if !print_line(&format!("{}{value}\n    {}\n", o.flag, o.description)) {
+                        break;
+                    }
+                }
+            }
+
+            None => {
+                for e in fx::list_effects(&tool)? {
+                    if !print_line(&format!("{:<16} {}", e.name, e.description)) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn capture_effect(
+        &self,
+        arg: &str,
+        replace: bool,
+        timeline: &Timeline,
+        path: &Path,
+    ) -> Result<Edit> {
+        let (place, effect) = arg.split_once('=').ok_or_else(|| {
+            anyhow!("invalid effect '{arg}', expected AT=EFFECT (or FROM..TO=EFFECT to replace)")
+        })?;
+
+        let n = timeline.original_len();
+
+        // where it goes, and the screen it animates
+        let (at, replaced) = if replace {
+            let (from, to) = parse_range(place, n)?;
+            (from, Some(to))
+        } else {
+            (parse_at(place, n)?, None)
+        };
+
+        let source = match (&self.fx_text, &self.fx_region, self.fx_screen) {
+            (Some(text), None, false) => fx::FxSource::Text {
+                text: text.replace("\\n", "\n"),
+            },
+            (None, Some(region), false) => parse_region(region)?,
+            (None, None, true) => fx::FxSource::Screen,
+            _ => bail!("give exactly one of --fx-text, --fx-region or --fx-screen"),
+        };
+
+        let spec = fx::FxSpec {
+            effect: effect.trim().to_owned(),
+            source,
+            args: self.fx_arg.clone(),
+            speed: self.fx_speed,
+            duration: self.fx_duration,
+            seed: self.fx_seed.unwrap_or_else(|| rand::random::<u32>() as u64),
+            keep_colors: self.fx_keep_colors,
+        };
+
+        let tool = fx::find_tool()?;
+        status::info!("Capturing {} with {}...", spec.effect, tool.name());
+        let screen = timeline.original_vt_at(replaced.map_or(at, |to| to + 1));
+        let cache = fx::capture_to_cache(&tool, &spec, &screen, path)?;
+
+        let clip = Clip::Effect {
+            fx: spec,
+            hold: self.fx_hold,
+            cache,
+        };
+
+        Ok(match replaced {
+            Some(to) => Edit::Replace { from: at, to, clip },
+            None => Edit::Insert { at, clip },
+        })
+    }
+
     fn render(&self, timeline: &Timeline, input: &Path, output: &str) -> Result<()> {
         warn_idle_time_limit(timeline);
 
@@ -261,6 +372,11 @@ fn print_events(timeline: &Timeline) -> Result<()> {
     Ok(())
 }
 
+/// Prints a line; false once stdout is closed (e.g. piped into `head`).
+fn print_line(line: &str) -> bool {
+    writeln!(io::stdout().lock(), "{line}").is_ok()
+}
+
 fn print_frame(timeline: &Timeline, secs: f64) -> Result<()> {
     if !secs.is_finite() || secs < 0.0 {
         bail!("--frame must be a non-negative number of seconds");
@@ -341,6 +457,9 @@ pub(crate) fn describe(edit: &Edit) -> String {
         Edit::SetTheme { theme: None } => "remove the color theme".to_owned(),
         Edit::Delete { from, to } => format!("cut events {from}..{to}"),
         Edit::Insert { at, ref clip } => format!("insert {} at {at}", clip.describe()),
+        Edit::Replace { from, to, ref clip } => {
+            format!("replace events {from}..{to} with {}", clip.describe())
+        }
     }
 }
 
@@ -433,6 +552,26 @@ fn parse_insert_cast(s: &str, event_count: usize) -> Result<Edit> {
             from,
             to,
         },
+    })
+}
+
+/// Parses `COL,ROW,COLSxROWS`.
+pub(crate) fn parse_region(s: &str) -> Result<fx::FxSource> {
+    let err = || anyhow!("invalid region '{s}', expected COL,ROW,COLSxROWS (e.g. 0,2,40x3)");
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+
+    let [col, row, size] = parts[..] else {
+        return Err(err());
+    };
+
+    let (cols, rows) = size.split_once('x').ok_or_else(err)?;
+    let num = |v: &str| v.trim().parse::<usize>().map_err(|_| err());
+
+    Ok(fx::FxSource::Region {
+        col: num(col)?,
+        row: num(row)?,
+        cols: num(cols)?,
+        rows: num(rows)?,
     })
 }
 
@@ -594,6 +733,19 @@ mod tests {
             insert_text: vec![],
             insert_cast: vec![],
             duplicate: vec![],
+            insert_effect: None,
+            replace_effect: None,
+            fx_duration: None,
+            fx_text: None,
+            fx_region: None,
+            fx_screen: false,
+            fx_speed: 1.0,
+            fx_seed: None,
+            fx_hold: 1.0,
+            fx_keep_colors: false,
+            fx_arg: vec![],
+            fx_list: false,
+            fx_options: None,
             overwrite: false,
         }
     }

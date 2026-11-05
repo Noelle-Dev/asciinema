@@ -106,6 +106,14 @@ pub fn render_in_place(timeline: &Timeline, source: &Path, sidecar: &Path) -> Re
             .with_context(|| format!("can't remove edit list {}", sidecar.display()))?;
     }
 
+    // captured effects are now part of the recording
+    let effects = super::fx::cache_dir(source);
+
+    if effects.is_dir() {
+        fs::remove_dir_all(&effects)
+            .with_context(|| format!("can't remove effects cache {}", effects.display()))?;
+    }
+
     Ok(backup)
 }
 

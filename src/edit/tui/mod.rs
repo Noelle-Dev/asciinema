@@ -2,6 +2,7 @@
 
 mod app;
 mod color;
+mod fxpanel;
 mod meta;
 mod ui;
 
@@ -51,7 +52,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
     while !app.quit {
         terminal.draw(|frame| areas = ui::draw(frame, app))?;
 
-        let timeout = if app.is_playing() {
+        let timeout = if app.is_animating() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(250)
@@ -124,6 +125,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.fx.is_some() {
+        fxpanel::handle_key(app, key);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => app.quit = true,
 
@@ -168,6 +174,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('t') => app.toggle_mode(),
         KeyCode::Char('C') => meta::open_cursor_picker(app),
         KeyCode::Char('m') => meta::open(app),
+        KeyCode::Char('x') => fxpanel::open(app),
         KeyCode::Char('(') => app.zoom_by(2.0),
         KeyCode::Char(')') => app.zoom_by(0.5),
         KeyCode::Char('f') => app.fullscreen = !app.fullscreen,
@@ -204,6 +211,32 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, areas: Areas) {
     if app.meta.is_some() && contains(areas.meta, mx, my) {
         meta::handle_mouse(app, mouse, areas.meta);
         return;
+    }
+
+    if app.fx.is_some() {
+        if contains(areas.meta, mx, my) {
+            fxpanel::handle_panel_mouse(app, mouse, areas.meta);
+            return;
+        }
+
+        // picking a region: map the mouse to a cell of the recorded screen
+        let p = areas.preview;
+        let (ox, oy) = app.viewport_offset(p.width as usize, p.height as usize);
+        let (cols, rows) = app.vt().size();
+        let cell = contains(p, mx, my).then(|| {
+            (
+                (ox + (mx - p.x) as usize).min(cols.saturating_sub(1)),
+                (oy + (my - p.y) as usize).min(rows.saturating_sub(1)),
+            )
+        });
+
+        if matches!(
+            app.fx.as_ref().map(|f| &f.mode),
+            Some(fxpanel::Mode::PickRegion)
+        ) {
+            fxpanel::handle_preview_mouse(app, mouse, cell);
+            return;
+        }
     }
     let tl = areas.timeline;
     let in_timeline = contains(tl, mx, my);

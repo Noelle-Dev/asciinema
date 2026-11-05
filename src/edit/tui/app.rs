@@ -124,6 +124,8 @@ pub struct App {
     pub selection_anchor: Option<usize>,
     /// Metadata side panel, when open.
     pub meta: Option<super::meta::Panel>,
+    /// Effect side panel, when open.
+    pub fx: Option<super::fxpanel::FxPanel>,
     pub prompt: Option<Prompt>,
     pub drag: Option<Drag>,
     message: Option<(String, bool, Instant)>,
@@ -159,6 +161,7 @@ impl App {
             auto_scroll_offset: Cell::new((0, 0)),
             selection_anchor: None,
             meta: None,
+            fx: None,
             prompt: None,
             drag: None,
             message: None,
@@ -307,6 +310,16 @@ impl App {
         self.playback.is_some()
     }
 
+    /// Whether the screen is animating (playback or an effect preview), so
+    /// the UI should redraw often.
+    pub fn is_animating(&self) -> bool {
+        self.is_playing()
+            || self
+                .fx
+                .as_ref()
+                .is_some_and(|f| f.preview.is_some() || f.busy())
+    }
+
     pub fn toggle_play(&mut self) {
         if self.playback.is_some() {
             self.stop();
@@ -329,6 +342,8 @@ impl App {
 
     /// Advances playback; call regularly.
     pub fn tick(&mut self) {
+        super::fxpanel::tick(self);
+
         if let Some(pb) = &self.playback {
             let t = pb.from + pb.started.elapsed();
             self.set_time(t);
@@ -348,17 +363,30 @@ impl App {
         };
     }
 
-    /// Selected events (inclusive), whose delays range edits apply to.
+    /// The selected frames, as the playlist items that drew them (inclusive):
+    /// from the frame showing when `v` was pressed to the one showing now.
     pub fn selection(&self) -> Option<(usize, usize)> {
         let anchor = self.selection_anchor?;
         let last = self.len().checked_sub(1)?;
-        let (lo, hi) = (anchor.min(self.position), anchor.max(self.position));
+        let frame = |p: usize| p.saturating_sub(1).min(last);
+        let (a, b) = (frame(anchor), frame(self.position));
 
-        Some((lo.min(last), hi.min(last)))
+        Some((a.min(b), a.max(b)))
+    }
+
+    /// The item that drew the frame on screen (`None` before the first one).
+    pub fn current_frame(&self) -> Option<usize> {
+        self.position.checked_sub(1).filter(|&i| i < self.len())
+    }
+
+    /// The selected frames, or else the one on screen.
+    pub fn frames(&self) -> Option<(usize, usize)> {
+        self.selection()
+            .or_else(|| self.current_frame().map(|i| (i, i)))
     }
 
     /// Original events covered by playlist items `lo..=hi` (cut ranges included).
-    fn events_in(&self, lo: usize, hi: usize) -> Option<(usize, usize)> {
+    pub fn events_in(&self, lo: usize, hi: usize) -> Option<(usize, usize)> {
         let mut range: Option<(usize, usize)> = None;
 
         for i in lo..=hi {
@@ -453,9 +481,14 @@ impl App {
                 }
 
                 // now cut: at the cut, before its jump
+                // now cut: at the cut, before its jump; replaced: the next event
                 Some(e) => (0..self.len())
                     .find(|&i| {
                         matches!(self.timeline.origin(i), Some(Origin::Cut { from, to }) if (from..=to).contains(&e))
+                    })
+                    .or_else(|| {
+                        (e..self.timeline.original_len())
+                            .find_map(|e| self.timeline.position_of_event(e))
                     })
                     .unwrap_or(self.len()),
 
@@ -511,10 +544,18 @@ impl App {
         self.swap_history(false);
     }
 
+    /// The editable pause the playhead is in, in seconds.
+    fn target_delay_secs(&self) -> Option<f64> {
+        self.target_event()
+            .and_then(|e| self.timeline.event_delay(e))
+            .map(|d| d.as_secs_f64())
+    }
+
     pub fn nudge(&mut self, delta: f64) {
         match self.target_event() {
             Some(event) => {
-                let secs = round_ms((self.delay_secs(self.position) + delta).max(0.0));
+                let now = self.target_delay_secs().unwrap_or_default();
+                let secs = round_ms((now + delta).max(0.0));
                 self.commit(Edit::SetDelay { event, secs });
             }
 
@@ -561,20 +602,19 @@ impl App {
             .enumerate()
             .filter_map(|(i, e)| match e {
                 Edit::Insert { at, .. } => Some((i, *at)),
+                Edit::Replace { from, .. } => Some((i, *from)),
                 _ => None,
             })
             .nth(k)
     }
 
-    /// Cuts the selection (events and inserted clips in it), or the event or
-    /// clip at the playhead.
+    /// Cuts the selected frames, or the frame on screen (the events behind
+    /// them, and any inserted clips among them).
     pub fn delete(&mut self) {
-        let (lo, hi) = self.selection().unwrap_or((self.position, self.position));
-
-        if lo >= self.len() {
-            self.info("At the end - nothing to cut");
+        let Some((lo, hi)) = self.frames() else {
+            self.info("Nothing on screen yet - step forward to a frame to cut it");
             return;
-        }
+        };
 
         let mut events: Option<(usize, usize)> = None;
         let mut clips = Vec::new();
@@ -653,24 +693,49 @@ impl App {
         });
     }
 
+    /// Number of clips (inserts and replaces) so far; the next one's number.
+    fn clip_count(&self) -> usize {
+        self.edits
+            .edits
+            .iter()
+            .filter(|e| matches!(e, Edit::Insert { .. } | Edit::Replace { .. }))
+            .count()
+    }
+
+    /// Puts the playhead on clip `k`'s first frame, so it's on screen (and
+    /// `d` would remove it).
+    fn seek_to_clip(&mut self, k: usize) {
+        if let Some(start) =
+            (0..self.len()).find(|&i| self.timeline.origin(i) == Some(Origin::Clip { insert: k }))
+        {
+            self.seek_position(start + 1);
+        }
+    }
+
     /// Inserts `clip` at the playhead, leaving the playhead at its start.
     pub fn insert(&mut self, clip: Clip) {
         let at = self.insert_position();
         let msg = format!("Inserted {} (saved)", clip.describe());
-        let k = self
-            .edits
-            .edits
-            .iter()
-            .filter(|e| matches!(e, Edit::Insert { .. }))
-            .count();
+        let k = self.clip_count();
 
         self.transact(msg, |list| list.push(Edit::Insert { at, clip }).map(|_| ()));
+        self.seek_to_clip(k);
+    }
 
-        if let Some(start) =
-            (0..self.len()).find(|&i| self.timeline.origin(i) == Some(Origin::Clip { insert: k }))
-        {
-            self.seek_position(start);
-        }
+    /// Plays `clip` instead of original events `from..=to`, leaving the
+    /// playhead at its start.
+    pub fn replace(&mut self, from: usize, to: usize, clip: Clip) {
+        let msg = format!(
+            "Replaced events {from}..{to} with {} (saved)",
+            clip.describe()
+        );
+        let k = self.clip_count();
+        self.selection_anchor = None;
+
+        self.transact(msg, |list| {
+            list.push(Edit::Replace { from, to, clip }).map(|_| ())
+        });
+        self.seek_to_clip(k);
     }
 
     /// Copies the selected events to right after the selection.
@@ -877,8 +942,8 @@ impl App {
     pub fn open_prompt(&mut self, kind: PromptKind) {
         let input = match kind {
             PromptKind::SetDelay => self
-                .target_event()
-                .map(|_| format!("{:.3}", self.delay_secs(self.position)))
+                .target_delay_secs()
+                .map(|d| format!("{d:.3}"))
                 .unwrap_or_default(),
 
             PromptKind::InsertHold | PromptKind::InsertBlank => "2".to_owned(),
@@ -978,7 +1043,7 @@ impl App {
                 }
             }
 
-            // the menu acts on a single key press (choose_insert)
+            // the menus act on a single key press (choose_insert, choose_text)
             PromptKind::InsertMenu => {}
 
             PromptKind::InsertHold | PromptKind::InsertBlank => match number() {
@@ -1196,7 +1261,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let tl = Timeline::new(header, events);
+        let mut tl = Timeline::new(header, events);
+        tl.set_clip_base(dir.path());
         let edits = EditList::new(tl.len());
 
         (App::new(path, edits_path, tl, edits), dir)
@@ -1285,9 +1351,10 @@ pub(crate) mod tests {
     fn cap_selection_or_everything() {
         let (mut app, _d) = app();
 
-        app.seek_position(1);
-        app.toggle_selection();
+        // the frames drawn by events 1 and 2
         app.seek_position(2);
+        app.toggle_selection();
+        app.seek_position(3);
         app.cap(1.0);
         assert_eq!(
             app.edits.edits,
@@ -1385,25 +1452,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn d_cuts_the_frame_on_screen() {
+        let (mut app, _d) = app();
+
+        app.seek_position(0);
+        app.delete();
+        assert!(app.edits.edits.is_empty(), "nothing on screen yet");
+
+        app.seek_position(2); // showing "$ l", drawn by event 1
+        app.delete();
+        assert_eq!(app.edits.edits, [Edit::Delete { from: 1, to: 1 }]);
+    }
+
+    #[test]
     fn cut_selection_then_restore_part_of_it() {
         use crate::edit::timeline::Origin;
 
         let (mut app, _d) = app();
-        app.seek_position(1);
+        app.seek_position(2); // the frame drawn by event 1 ("l") ...
         app.toggle_selection();
-        app.seek_position(2); // events 1..2: "l" and "s"
+        app.seek_position(3); // ... to the one drawn by event 2 ("s")
         app.delete();
 
         assert_eq!(app.edits.edits, [Edit::Delete { from: 1, to: 2 }]);
         assert_eq!(app.timeline.position_of_event(1), None);
         assert_eq!(app.selection_anchor, None);
 
-        // the playhead stays before the same original event
-        let cut = app.timeline.origin(app.position);
+        // the playhead is on the cut's jump: the screen looks as it did
+        // (the jump shows what the cut part drew)
+        let cut = app.current_frame().and_then(|i| app.timeline.origin(i));
         assert_eq!(cut, Some(Origin::Cut { from: 1, to: 2 }));
-
-        // jumping over the cut shows what it drew
-        app.step(1);
         assert_eq!(row(&app, 0), "$ ls");
 
         // D prefills the whole cut; restoring just event 2 splits it
@@ -1481,9 +1559,9 @@ pub(crate) mod tests {
     #[test]
     fn duplicate_selection() {
         let (mut app, _d) = app();
-        app.seek_position(1);
-        app.toggle_selection();
         app.seek_position(2);
+        app.toggle_selection();
+        app.seek_position(3);
         app.duplicate_selection();
 
         assert_eq!(
@@ -1502,9 +1580,9 @@ pub(crate) mod tests {
     #[test]
     fn retiming_still_targets_original_events_after_a_cut() {
         let (mut app, _d) = app();
-        app.seek_position(0);
-        app.toggle_selection();
         app.seek_position(1);
+        app.toggle_selection();
+        app.seek_position(2);
         app.delete(); // cut events 0..1
 
         // the playhead is at the cut's jump, whose pause is event 2's

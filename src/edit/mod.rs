@@ -6,6 +6,7 @@
 //! the interactive editor and the `--render` path share one implementation.
 
 pub mod edits;
+pub mod fx;
 pub mod render;
 pub mod retime;
 pub mod themes;

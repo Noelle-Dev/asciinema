@@ -52,6 +52,10 @@ pub enum Edit {
     /// Insert a clip at position `at`: after `at` events, before event `at`.
     /// When the clip ends, the screen is redrawn as it was before it.
     Insert { at: usize, clip: Clip },
+
+    /// Play a clip instead of events `from..=to`. When it ends, the screen is
+    /// as it looked after those events.
+    Replace { from: usize, to: usize, clip: Clip },
 }
 
 /// Something inserted into the timeline.
@@ -66,6 +70,16 @@ pub enum Clip {
 
     /// Text centered on a cleared screen.
     Text { text: String, secs: f64 },
+
+    /// A text effect captured from ttfx/tte, cached in `cache` (relative to
+    /// the recording's directory). It plays over the screen at the insert
+    /// point, its last frame holds for `hold` seconds, then the screen is
+    /// restored.
+    Effect {
+        fx: super::fx::FxSpec,
+        hold: f64,
+        cache: String,
+    },
 
     /// Events `from..=to` (`to` omitted: to the end) of another recording,
     /// or of this one when `path` is omitted.
@@ -87,6 +101,8 @@ impl Clip {
                 let first = text.lines().next().unwrap_or("");
                 format!("text \"{first}\" for {secs}s")
             }
+            Clip::Effect { fx, .. } => format!("{} effect on {}", fx.effect, fx.source.describe()),
+
             Clip::Recording { path, from, to } => {
                 let range = match to {
                     Some(to) => format!("{from}..{to}"),
@@ -179,7 +195,8 @@ pub fn apply_header(original: &Header, edits: &[Edit]) -> Header {
             | Edit::Scale { .. }
             | Edit::CapIdle { .. }
             | Edit::Delete { .. }
-            | Edit::Insert { .. } => {}
+            | Edit::Insert { .. }
+            | Edit::Replace { .. } => {}
         }
     }
 
@@ -279,7 +296,8 @@ impl EditList {
             Edit::Scale { .. }
             | Edit::CapIdle { .. }
             | Edit::Delete { .. }
-            | Edit::Insert { .. } => {}
+            | Edit::Insert { .. }
+            | Edit::Replace { .. } => {}
 
             // header edits: one of each kind
             _ => {
@@ -418,46 +436,78 @@ impl Edit {
                     bail!("insert position {at} out of range (0..={event_count})");
                 }
 
-                match clip {
-                    Clip::Hold { secs } | Clip::Blank { secs } | Clip::Text { secs, .. } => {
-                        if !secs.is_finite() || *secs <= 0.0 {
-                            bail!("clip duration must be a positive number of seconds, got {secs}");
-                        }
-                    }
+                validate_clip(clip, event_count)
+            }
 
-                    Clip::Recording { .. } => {}
-                }
-
-                match clip {
-                    Clip::Text { text, .. } if text.trim().is_empty() => {
-                        bail!("a text clip needs some text")
-                    }
-
-                    Clip::Recording {
-                        from, to: Some(to), ..
-                    } if from > to => {
-                        bail!("invalid event range {from}..{to}: start is after end")
-                    }
-
-                    Clip::Recording {
-                        path: None,
-                        from,
-                        to,
-                        ..
-                    } => {
-                        check_index(*from)?;
-
-                        if let Some(to) = to {
-                            check_index(*to)?;
-                        }
-
-                        Ok(())
-                    }
-
-                    _ => Ok(()),
-                }
+            Edit::Replace { from, to, ref clip } => {
+                check_range(from, to)?;
+                validate_clip(clip, event_count)
             }
         }
+    }
+}
+
+fn validate_clip(clip: &Clip, event_count: usize) -> Result<()> {
+    let check_index = |i: usize| -> Result<()> {
+        if i >= event_count {
+            bail!(
+                "event index {i} out of range (recording has {event_count} events, 0..={})",
+                event_count.saturating_sub(1)
+            );
+        }
+
+        Ok(())
+    };
+
+    match clip {
+        Clip::Hold { secs } | Clip::Blank { secs } | Clip::Text { secs, .. } => {
+            if !secs.is_finite() || *secs <= 0.0 {
+                bail!("clip duration must be a positive number of seconds, got {secs}");
+            }
+        }
+
+        Clip::Recording { .. } => {}
+
+        Clip::Effect { fx, hold, cache } => {
+            fx.validate()?;
+
+            if !hold.is_finite() || *hold < 0.0 {
+                bail!("effect hold must be zero or more seconds, got {hold}");
+            }
+
+            if cache.is_empty() {
+                bail!("effect has no captured frames");
+            }
+        }
+    }
+
+    match clip {
+        Clip::Text { text, .. } if text.trim().is_empty() => {
+            bail!("a text clip needs some text")
+        }
+
+        Clip::Recording {
+            from, to: Some(to), ..
+        } if from > to => {
+            bail!("invalid event range {from}..{to}: start is after end")
+        }
+
+        Clip::Recording {
+            path: None,
+            from,
+            to,
+            ..
+        } => {
+            check_index(*from)?;
+
+            if let Some(to) = to {
+                check_index(*to)?;
+            }
+
+            Ok(())
+        }
+
+        _ => Ok(()),
     }
 }
 
