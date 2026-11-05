@@ -11,7 +11,8 @@ use anyhow::Result;
 use avt::Vt;
 
 use crate::asciicast::{self, EventData};
-use crate::edit::{render, Edit, EditList, Timeline};
+use crate::edit::timeline::Origin;
+use crate::edit::{render, Clip, Edit, EditList, Timeline};
 
 /// Max events to replay incrementally before falling back to a keyframe seek.
 const MAX_INCREMENTAL: usize = 2000;
@@ -43,12 +44,25 @@ pub enum PromptKind {
     Title,
     Command,
     IdleLimit,
+    /// Single-key menu: what to insert.
+    InsertMenu,
+    InsertHold,
+    InsertBlank,
+    InsertText,
+    /// Second step of a text card: how long (the text is in `stash`).
+    InsertTextSecs,
+    InsertRecording,
+    /// Second step of inserting a recording: which events (path in `stash`).
+    InsertRecordingRange,
+    Restore,
 }
 
 #[derive(Debug, Clone)]
 pub struct Prompt {
     pub kind: PromptKind,
     pub input: String,
+    /// Input from an earlier step of a multi-step prompt.
+    pub stash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +71,9 @@ pub enum Drag {
     Scrub,
     /// Dragging an event's tick to change the delay before it.
     Event {
+        /// Playlist item being dragged.
+        item: usize,
+        /// Original event whose delay changes.
         event: usize,
         start_x: u16,
         original_delay: f64,
@@ -112,12 +129,15 @@ pub struct App {
     message: Option<(String, bool, Instant)>,
     pub quit: bool,
 
-    vt_cache: RefCell<(usize, Vt)>,
+    /// (structure version, position, screen) - positions shift when the
+    /// playlist's structure changes, so the version is part of the key.
+    vt_cache: RefCell<(u64, usize, Vt)>,
 }
 
 impl App {
     pub fn new(path: PathBuf, edits_path: PathBuf, timeline: Timeline, edits: EditList) -> Self {
         let vt = timeline.vt_at_position(0);
+        let timeline_version = timeline.structure_version;
 
         Self {
             path,
@@ -143,7 +163,7 @@ impl App {
             drag: None,
             message: None,
             quit: false,
-            vt_cache: RefCell::new((0, vt)),
+            vt_cache: RefCell::new((timeline_version, 0, vt)),
         }
     }
 
@@ -155,20 +175,27 @@ impl App {
     /// The cache is only borrowed mutably when it's out of date, so callers
     /// may hold the returned `Ref` while calling other `&self` methods.
     pub fn vt(&self) -> Ref<'_, Vt> {
-        if self.vt_cache.borrow().0 != self.position {
-            let mut cache = self.vt_cache.borrow_mut();
-            let (pos, vt) = &mut *cache;
+        let version = self.timeline.structure_version;
+        let stale = {
+            let (v, pos, _) = &*self.vt_cache.borrow();
+            *v != version || *pos != self.position
+        };
 
-            if *pos < self.position && self.position - *pos <= MAX_INCREMENTAL {
+        if stale {
+            let mut cache = self.vt_cache.borrow_mut();
+            let (v, pos, vt) = &mut *cache;
+
+            if *v == version && *pos < self.position && self.position - *pos <= MAX_INCREMENTAL {
                 self.timeline.advance(vt, *pos, self.position);
             } else {
                 *vt = self.timeline.vt_at_position(self.position);
             }
 
+            *v = version;
             *pos = self.position;
         }
 
-        Ref::map(self.vt_cache.borrow(), |(_, vt)| vt)
+        Ref::map(self.vt_cache.borrow(), |(_, _, vt)| vt)
     }
 
     // ---- messages -----------------------------------------------------
@@ -228,8 +255,9 @@ impl App {
         self.seek_position(p);
     }
 
-    fn delay_secs(&self, event: usize) -> f64 {
-        self.timeline.delay(event).unwrap_or_default().as_secs_f64()
+    /// Delay before playlist item `i`, in seconds.
+    fn delay_secs(&self, i: usize) -> f64 {
+        self.timeline.delay(i).unwrap_or_default().as_secs_f64()
     }
 
     /// Moves into the next pause of at least [`PAUSE_THRESHOLD`], ready to edit it.
@@ -329,112 +357,364 @@ impl App {
         Some((lo.min(last), hi.min(last)))
     }
 
-    /// Selection, or the whole recording if nothing is selected.
-    fn selection_or_all(&self) -> Option<(usize, usize)> {
-        self.selection()
-            .or_else(|| self.len().checked_sub(1).map(|last| (0, last)))
+    /// Original events covered by playlist items `lo..=hi` (cut ranges included).
+    fn events_in(&self, lo: usize, hi: usize) -> Option<(usize, usize)> {
+        let mut range: Option<(usize, usize)> = None;
+
+        for i in lo..=hi {
+            let (a, b) = match self.timeline.origin(i) {
+                Some(Origin::Event(e)) => (e, e),
+                Some(Origin::Cut { from, to }) => (from, to),
+                _ => continue,
+            };
+
+            range = Some(range.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
+        }
+
+        range
+    }
+
+    /// Original events in the selection, or all of them if nothing is selected.
+    fn selected_events_or_all(&self) -> Option<(usize, usize)> {
+        match self.selection() {
+            Some((lo, hi)) => self.events_in(lo, hi),
+            None => self
+                .timeline
+                .original_len()
+                .checked_sub(1)
+                .map(|last| (0, last)),
+        }
     }
 
     // ---- editing ------------------------------------------------------
 
-    /// Event whose preceding pause the playhead is in.
+    /// Original event whose (editable) preceding pause the playhead is in.
+    /// `None` at the end, or inside an inserted clip.
     pub fn target_event(&self) -> Option<usize> {
-        (self.position < self.len()).then_some(self.position)
+        self.timeline.delay_owner(self.position)
+    }
+
+    fn no_pause_here(&mut self) {
+        if self.position >= self.len() {
+            self.info("At the end - no pause to edit");
+        } else {
+            self.info("Inside an inserted clip - its length is part of the clip");
+        }
     }
 
     /// Validates, records for undo, saves and applies `edit`.
     pub fn commit(&mut self, edit: Edit) {
-        let before = self.edits.edits.clone();
-
-        match self.edits.push(edit.clone()) {
-            Ok(_) => {
-                self.undo_stack.push(before);
-                self.redo_stack.clear();
-                self.after_change(format!("{} (saved)", crate::cmd::edit::describe(&edit)));
-            }
-
-            Err(e) => self.error(e.to_string()),
-        }
+        let description = crate::cmd::edit::describe(&edit);
+        self.transact(format!("{description} (saved)"), |edits| {
+            edits.push(edit).map(|_| ())
+        });
     }
 
-    fn after_change(&mut self, msg: String) {
-        self.timeline.apply_edits(&self.edits);
-        // Keep showing the same frame; only its time moved.
+    /// Changes the edit list as one undoable step. If the change is invalid,
+    /// or the result can't be built (e.g. a clip's file is missing), it's
+    /// rolled back and the error shown.
+    pub fn transact(&mut self, msg: String, change: impl FnOnce(&mut EditList) -> Result<()>) {
+        let before = self.edits.edits.clone();
+
+        if let Err(e) = change(&mut self.edits) {
+            self.edits.edits = before;
+            self.error(format!("{e:#}"));
+            return;
+        }
+
+        if let Err(e) = self.rebuild() {
+            self.edits.edits = before;
+            let _ = self.rebuild();
+            self.error(format!("{e:#}"));
+            return;
+        }
+
+        self.undo_stack.push(before);
+        self.redo_stack.clear();
+        self.saved(msg);
+    }
+
+    /// Re-applies the edit list, keeping the playhead on the same frame.
+    fn rebuild(&mut self) -> Result<()> {
+        // anchor on the original event the playhead is before
+        let anchor = (self.position..self.len()).find_map(|i| match self.timeline.origin(i) {
+            Some(Origin::Event(e)) => Some(e),
+            _ => None,
+        });
+
+        let version = self.timeline.structure_version;
+        self.timeline.apply_edits(&self.edits)?;
+
+        if self.timeline.structure_version != version {
+            self.position = match anchor {
+                // still there: the same frame, before it
+                Some(e) if self.timeline.position_of_event(e).is_some() => {
+                    self.timeline.position_of_event(e).unwrap_or(0)
+                }
+
+                // now cut: at the cut, before its jump
+                Some(e) => (0..self.len())
+                    .find(|&i| {
+                        matches!(self.timeline.origin(i), Some(Origin::Cut { from, to }) if (from..=to).contains(&e))
+                    })
+                    .unwrap_or(self.len()),
+
+                None => self.len(),
+            };
+        }
+
+        self.position = self.position.min(self.len());
         self.time = self.time_of_position(self.position);
 
+        Ok(())
+    }
+
+    fn saved(&mut self, msg: String) {
         match self.edits.save(&self.edits_path) {
             Ok(()) => self.info(msg),
             Err(e) => self.error(format!("couldn't save edits: {e:#}")),
         }
     }
 
-    pub fn undo(&mut self) {
-        match self.undo_stack.pop() {
-            Some(prev) => {
-                let current = std::mem::replace(&mut self.edits.edits, prev);
-                self.redo_stack.push(current);
-                self.after_change("Undone".to_owned());
-            }
+    fn swap_history(&mut self, undo: bool) {
+        let (from, to) = if undo {
+            (&mut self.undo_stack, &mut self.redo_stack)
+        } else {
+            (&mut self.redo_stack, &mut self.undo_stack)
+        };
 
-            None => self.info("Nothing to undo"),
+        let Some(edits) = from.pop() else {
+            self.info(if undo {
+                "Nothing to undo"
+            } else {
+                "Nothing to redo"
+            });
+            return;
+        };
+
+        let current = std::mem::replace(&mut self.edits.edits, edits);
+        to.push(current);
+
+        if let Err(e) = self.rebuild() {
+            self.error(format!("{e:#}"));
+            return;
         }
+
+        self.saved(if undo { "Undone" } else { "Redone" }.to_owned());
+    }
+
+    pub fn undo(&mut self) {
+        self.swap_history(true);
     }
 
     pub fn redo(&mut self) {
-        match self.redo_stack.pop() {
-            Some(next) => {
-                let current = std::mem::replace(&mut self.edits.edits, next);
-                self.undo_stack.push(current);
-                self.after_change("Redone".to_owned());
-            }
-
-            None => self.info("Nothing to redo"),
-        }
+        self.swap_history(false);
     }
 
     pub fn nudge(&mut self, delta: f64) {
         match self.target_event() {
             Some(event) => {
-                let secs = round_ms((self.delay_secs(event) + delta).max(0.0));
+                let secs = round_ms((self.delay_secs(self.position) + delta).max(0.0));
                 self.commit(Edit::SetDelay { event, secs });
             }
 
-            None => self.info("At the end - no pause to edit"),
+            None => self.no_pause_here(),
         }
     }
 
     pub fn set_delay(&mut self, secs: f64) {
         match self.target_event() {
             Some(event) => self.commit(Edit::SetDelay { event, secs }),
-            None => self.info("At the end - no pause to edit"),
+            None => self.no_pause_here(),
         }
     }
 
     pub fn cap(&mut self, max: f64) {
-        if let Some((from, to)) = self.selection_or_all() {
+        if let Some((from, to)) = self.selected_events_or_all() {
             self.commit(Edit::CapIdle { from, to, max });
         }
     }
 
     pub fn scale(&mut self, factor: f64) {
-        if let Some((from, to)) = self.selection_or_all() {
+        if let Some((from, to)) = self.selected_events_or_all() {
             self.commit(Edit::Scale { from, to, factor });
         }
     }
 
+    // ---- cutting & inserting ------------------------------------------------
+
+    /// Original position a clip inserted at the playhead goes to.
+    pub fn insert_position(&self) -> usize {
+        match self.timeline.origin(self.position) {
+            Some(Origin::Event(e)) => e,
+            Some(Origin::Cut { to, .. }) => to + 1,
+            Some(Origin::Clip { insert }) => self.insert_edit(insert).map_or(0, |(_, at)| at),
+            None => self.timeline.original_len(),
+        }
+    }
+
+    /// The `k`-th insert edit: (index in the edit list, position).
+    fn insert_edit(&self, k: usize) -> Option<(usize, usize)> {
+        self.edits
+            .edits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Edit::Insert { at, .. } => Some((i, *at)),
+                _ => None,
+            })
+            .nth(k)
+    }
+
+    /// Cuts the selection (events and inserted clips in it), or the event or
+    /// clip at the playhead.
+    pub fn delete(&mut self) {
+        let (lo, hi) = self.selection().unwrap_or((self.position, self.position));
+
+        if lo >= self.len() {
+            self.info("At the end - nothing to cut");
+            return;
+        }
+
+        let mut events: Option<(usize, usize)> = None;
+        let mut clips = Vec::new();
+
+        for i in lo..=hi {
+            match self.timeline.origin(i) {
+                Some(Origin::Event(e)) => {
+                    events = Some(events.map_or((e, e), |(a, b)| (a.min(e), b.max(e))));
+                }
+
+                Some(Origin::Clip { insert }) if !clips.contains(&insert) => clips.push(insert),
+                _ => {}
+            }
+        }
+
+        if events.is_none() && clips.is_empty() {
+            self.info("Already cut - D restores it");
+            return;
+        }
+
+        let remove: Vec<usize> = clips
+            .iter()
+            .filter_map(|&k| self.insert_edit(k).map(|(i, _)| i))
+            .collect();
+
+        let msg = match (events, clips.len()) {
+            (Some((a, b)), 0) => format!("Cut events {a}..{b} (saved; D restores)"),
+            (Some((a, b)), n) => format!("Cut events {a}..{b} and {n} inserted clip(s) (saved)"),
+            (None, n) => format!("Removed {n} inserted clip(s) (saved)"),
+        };
+
+        self.selection_anchor = None;
+
+        self.transact(msg, |list| {
+            let mut i = 0;
+            list.edits.retain(|_| {
+                let keep = !remove.contains(&i);
+                i += 1;
+                keep
+            });
+
+            if let Some((from, to)) = events {
+                list.push(Edit::Delete { from, to })?;
+            }
+
+            Ok(())
+        });
+    }
+
+    /// The cut nearest the playhead (or in the selection), as an event range.
+    pub fn cut_to_restore(&self) -> Option<(usize, usize)> {
+        if let Some((lo, hi)) = self.selection() {
+            let (a, b) = self.events_in(lo, hi)?;
+            let cut: Vec<usize> = (a..=b).filter(|&e| self.edits.is_deleted(e)).collect();
+
+            return Some((*cut.first()?, *cut.last()?));
+        }
+
+        [self.position, self.position.wrapping_sub(1)]
+            .iter()
+            .find_map(|&i| match self.timeline.origin(i) {
+                Some(Origin::Cut { from, to }) => Some((from, to)),
+                _ => None,
+            })
+    }
+
+    pub fn restore(&mut self, from: usize, to: usize) {
+        self.selection_anchor = None;
+
+        self.transact(format!("Restored events {from}..{to} (saved)"), |list| {
+            if list.restore(from, to) {
+                Ok(())
+            } else {
+                anyhow::bail!("nothing is cut in {from}..{to}")
+            }
+        });
+    }
+
+    /// Inserts `clip` at the playhead, leaving the playhead at its start.
+    pub fn insert(&mut self, clip: Clip) {
+        let at = self.insert_position();
+        let msg = format!("Inserted {} (saved)", clip.describe());
+        let k = self
+            .edits
+            .edits
+            .iter()
+            .filter(|e| matches!(e, Edit::Insert { .. }))
+            .count();
+
+        self.transact(msg, |list| list.push(Edit::Insert { at, clip }).map(|_| ()));
+
+        if let Some(start) =
+            (0..self.len()).find(|&i| self.timeline.origin(i) == Some(Origin::Clip { insert: k }))
+        {
+            self.seek_position(start);
+        }
+    }
+
+    /// Copies the selected events to right after the selection.
+    pub fn duplicate_selection(&mut self) {
+        let Some((from, to)) = self.selection().and_then(|(lo, hi)| self.events_in(lo, hi)) else {
+            self.info("Select a range first (v), then duplicate it");
+            return;
+        };
+
+        self.selection_anchor = None;
+        self.seek_position(
+            self.timeline
+                .position_of_event(to)
+                .map_or(self.len(), |p| p + 1),
+        );
+        self.insert(Clip::Recording {
+            path: None,
+            from,
+            to: Some(to),
+        });
+    }
+
     // ---- dragging -----------------------------------------------------
 
+    /// Starts dragging playlist item `item` to change the pause before it.
     pub fn start_event_drag(
         &mut self,
-        event: usize,
+        item: usize,
         x: u16,
         secs_per_col: f64,
         frozen_window: Option<(Duration, Duration)>,
     ) {
         self.stop();
-        let original_delay = self.delay_secs(event);
+
+        let Some(event) = self.timeline.delay_owner(item) else {
+            self.seek_position(item);
+            self.info("That's part of an inserted clip - its timing is fixed");
+            return;
+        };
+
+        let original_delay = self.delay_secs(item);
 
         self.drag = Some(Drag::Event {
+            item,
             event,
             start_x: x,
             original_delay,
@@ -443,7 +723,7 @@ impl App {
             frozen_window,
         });
 
-        self.seek_position(event);
+        self.seek_position(item);
     }
 
     /// Updates a drag in progress, previewing the new timing without saving.
@@ -467,8 +747,10 @@ impl App {
         let event = *event;
         let secs = *new_delay;
 
-        if preview.push(Edit::SetDelay { event, secs }).is_ok() {
-            self.timeline.apply_edits(&preview);
+        // timing only, so this can't fail to build
+        if preview.push(Edit::SetDelay { event, secs }).is_ok()
+            && self.timeline.apply_edits(&preview).is_ok()
+        {
             self.time = self.time_of_position(self.position);
         }
     }
@@ -487,15 +769,14 @@ impl App {
                     secs: new_delay,
                 });
             } else {
-                self.timeline.apply_edits(&self.edits);
+                let _ = self.rebuild();
             }
         }
     }
 
     pub fn cancel_drag(&mut self) {
         if matches!(self.drag.take(), Some(Drag::Event { .. })) {
-            self.timeline.apply_edits(&self.edits);
-            self.time = self.time_of_position(self.position);
+            let _ = self.rebuild();
         }
     }
 
@@ -597,8 +878,18 @@ impl App {
         let input = match kind {
             PromptKind::SetDelay => self
                 .target_event()
-                .map(|e| format!("{:.3}", self.delay_secs(e)))
+                .map(|_| format!("{:.3}", self.delay_secs(self.position)))
                 .unwrap_or_default(),
+
+            PromptKind::InsertHold | PromptKind::InsertBlank => "2".to_owned(),
+
+            PromptKind::Restore => match self.cut_to_restore() {
+                Some((a, b)) => format!("{a}..{b}"),
+                None => {
+                    self.info("No cut here - move the playhead to a ✂ or select across one");
+                    return;
+                }
+            },
 
             PromptKind::Title => self.timeline.header.title.clone().unwrap_or_default(),
             PromptKind::Command => self.timeline.header.command.clone().unwrap_or_default(),
@@ -612,11 +903,15 @@ impl App {
             _ => String::new(),
         };
 
-        self.prompt = Some(Prompt { kind, input });
+        self.prompt = Some(Prompt {
+            kind,
+            input,
+            stash: String::new(),
+        });
     }
 
     pub fn submit_prompt(&mut self) {
-        let Some(Prompt { kind, input }) = self.prompt.take() else {
+        let Some(Prompt { kind, input, stash }) = self.prompt.take() else {
             return;
         };
 
@@ -682,6 +977,75 @@ impl App {
                     self.info("Render in place cancelled");
                 }
             }
+
+            // the menu acts on a single key press (choose_insert)
+            PromptKind::InsertMenu => {}
+
+            PromptKind::InsertHold | PromptKind::InsertBlank => match number() {
+                Some(secs) if kind == PromptKind::InsertHold => self.insert(Clip::Hold { secs }),
+                Some(secs) => self.insert(Clip::Blank { secs }),
+                None => self.error(format!("not a number: '{input}'")),
+            },
+
+            PromptKind::InsertText => {
+                if input.is_empty() {
+                    return;
+                }
+
+                // literal \n starts a new line, since the prompt is one line
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::InsertTextSecs,
+                    input: "3".to_owned(),
+                    stash: input.replace("\\n", "\n"),
+                });
+            }
+
+            PromptKind::InsertTextSecs => match number() {
+                Some(secs) => self.insert(Clip::Text { text: stash, secs }),
+                None => self.error(format!("not a number: '{input}'")),
+            },
+
+            PromptKind::InsertRecording => {
+                if input.is_empty() {
+                    return;
+                }
+
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::InsertRecordingRange,
+                    input: String::new(),
+                    stash: input.to_owned(),
+                });
+            }
+
+            PromptKind::InsertRecordingRange => match parse_range(input) {
+                Some((from, to)) => self.insert(Clip::Recording {
+                    path: Some(stash),
+                    from,
+                    to,
+                }),
+                None => self.error(format!(
+                    "not a range: '{input}' (e.g. 10..200, 10.., or empty for all)"
+                )),
+            },
+
+            PromptKind::Restore => match parse_range(input) {
+                Some((from, Some(to))) => self.restore(from, to),
+                _ => self.error(format!("not a range: '{input}' (e.g. 10..20)")),
+            },
+        }
+    }
+
+    /// Handles a key press in the insert menu.
+    pub fn choose_insert(&mut self, key: char) {
+        self.prompt = None;
+
+        match key {
+            'h' => self.open_prompt(PromptKind::InsertHold),
+            'b' => self.open_prompt(PromptKind::InsertBlank),
+            't' => self.open_prompt(PromptKind::InsertText),
+            'r' => self.open_prompt(PromptKind::InsertRecording),
+            'd' => self.duplicate_selection(),
+            _ => {}
         }
     }
 
@@ -705,6 +1069,21 @@ impl App {
             PromptKind::Command => "Command (empty to remove): ".to_owned(),
             PromptKind::IdleLimit => "Idle time limit in secs (empty to remove): ".to_owned(),
 
+            PromptKind::InsertMenu => {
+                "Insert: h hold · b blank screen · t text card · r another recording · d duplicate selection (Esc cancels) "
+                    .to_owned()
+            }
+
+            PromptKind::InsertHold => "Hold the screen for (secs): ".to_owned(),
+            PromptKind::InsertBlank => "Blank screen for (secs): ".to_owned(),
+            PromptKind::InsertText => "Text card (\\n for a new line): ".to_owned(),
+            PromptKind::InsertTextSecs => "Show it for (secs): ".to_owned(),
+            PromptKind::InsertRecording => "Recording to insert (path): ".to_owned(),
+            PromptKind::InsertRecordingRange => {
+                "Its events, FROM..TO (empty for all, FROM.. to the end): ".to_owned()
+            }
+            PromptKind::Restore => "Restore cut events (FROM..TO, part of a cut is fine): ".to_owned(),
+
             PromptKind::ConfirmRenderInPlace => format!(
                 "Overwrite {} with {} edit(s)? Previous version kept as .bak [y/N]: ",
                 self.path.display(),
@@ -723,13 +1102,22 @@ impl App {
         let backup = render::render_in_place(&self.timeline, &self.path, &self.edits_path)?;
 
         // Reload: the edited recording is now the original.
-        let timeline = Timeline::load(asciicast::open_from_path(&self.path)?)?;
-        self.edits = EditList::new(timeline.len());
+        let mut timeline = Timeline::load(asciicast::open_from_path(&self.path)?)?;
+
+        if let Some(dir) = self.path.parent() {
+            timeline.set_clip_base(dir);
+        }
+
+        self.edits = EditList::new(timeline.original_len());
         self.timeline = timeline;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.selection_anchor = None;
-        *self.vt_cache.borrow_mut() = (0, self.timeline.vt_at_position(0));
+        *self.vt_cache.borrow_mut() = (
+            self.timeline.structure_version,
+            0,
+            self.timeline.vt_at_position(0),
+        );
         self.seek_position(self.position);
 
         self.info(format!(
@@ -739,6 +1127,34 @@ impl App {
         ));
 
         Ok(())
+    }
+}
+
+/// Parses `FROM..TO` / `FROM..` / `N` / empty (everything) into an event range.
+fn parse_range(s: &str) -> Option<(usize, Option<usize>)> {
+    let s = s.trim();
+
+    if s.is_empty() {
+        return Some((0, None));
+    }
+
+    match s.split_once("..") {
+        Some((a, b)) => {
+            let from = if a.trim().is_empty() {
+                0
+            } else {
+                a.trim().parse().ok()?
+            };
+            let to = if b.trim().is_empty() {
+                None
+            } else {
+                Some(b.trim().parse().ok()?)
+            };
+
+            Some((from, to))
+        }
+
+        None => s.parse().ok().map(|n| (n, Some(n))),
     }
 }
 
@@ -755,7 +1171,7 @@ pub(crate) mod tests {
 
     use super::{App, PromptKind};
     use crate::asciicast::{Event, Header};
-    use crate::edit::{Edit, EditList, Timeline};
+    use crate::edit::{Clip, Edit, EditList, Timeline};
 
     /// Events at 1, 2, 10, 11, 11.1 (marker), 20 seconds.
     pub(crate) fn app() -> (App, TempDir) {
@@ -962,6 +1378,142 @@ pub(crate) mod tests {
         assert!(dir.path().join("demo.cast.bak").exists());
         assert!((secs(&app, 2) - 1.0).abs() < 1e-3);
         assert_eq!(app.duration(), Duration::from_secs(13));
+    }
+
+    fn row(app: &App, r: usize) -> String {
+        app.vt().text()[r].trim_end().to_owned()
+    }
+
+    #[test]
+    fn cut_selection_then_restore_part_of_it() {
+        use crate::edit::timeline::Origin;
+
+        let (mut app, _d) = app();
+        app.seek_position(1);
+        app.toggle_selection();
+        app.seek_position(2); // events 1..2: "l" and "s"
+        app.delete();
+
+        assert_eq!(app.edits.edits, [Edit::Delete { from: 1, to: 2 }]);
+        assert_eq!(app.timeline.position_of_event(1), None);
+        assert_eq!(app.selection_anchor, None);
+
+        // the playhead stays before the same original event
+        let cut = app.timeline.origin(app.position);
+        assert_eq!(cut, Some(Origin::Cut { from: 1, to: 2 }));
+
+        // jumping over the cut shows what it drew
+        app.step(1);
+        assert_eq!(row(&app, 0), "$ ls");
+
+        // D prefills the whole cut; restoring just event 2 splits it
+        app.seek_position(1);
+        app.open_prompt(PromptKind::Restore);
+        assert_eq!(app.prompt.as_ref().unwrap().input, "1..2");
+        app.prompt.as_mut().unwrap().input = "2..2".to_owned();
+        app.submit_prompt();
+        assert_eq!(app.edits.edits, [Edit::Delete { from: 1, to: 1 }]);
+
+        app.undo();
+        assert_eq!(app.edits.edits, [Edit::Delete { from: 1, to: 2 }]);
+        app.undo();
+        assert!(app.edits.edits.is_empty());
+        assert_eq!(app.len(), 6);
+    }
+
+    #[test]
+    fn inserting_clips() {
+        use crate::edit::timeline::Origin;
+
+        let (mut app, _d) = app();
+        app.seek_position(3); // after "$ ls", before "\r\nfile"
+
+        // menu -> text -> secs
+        app.open_prompt(PromptKind::InsertMenu);
+        app.choose_insert('t');
+        app.prompt.as_mut().unwrap().input = "Hello\\nthere".to_owned();
+        app.submit_prompt();
+        assert_eq!(
+            app.prompt.as_ref().unwrap().kind,
+            PromptKind::InsertTextSecs
+        );
+        app.submit_prompt(); // default 3s
+
+        assert_eq!(
+            app.edits.edits,
+            [Edit::Insert {
+                at: 3,
+                clip: Clip::Text {
+                    text: "Hello\nthere".to_owned(),
+                    secs: 3.0
+                }
+            }]
+        );
+
+        // the playhead is at the start of the clip, and stepping in shows the card
+        assert_eq!(
+            app.timeline.origin(app.position),
+            Some(Origin::Clip { insert: 0 })
+        );
+        app.step(1);
+        // two lines centered on the 20x5 screen: rows 1 and 2
+        assert_eq!(row(&app, 1), "       Hello");
+        assert_eq!(row(&app, 2), "       there");
+        assert_eq!(app.target_event(), None, "clip timing isn't editable");
+        assert_eq!(app.duration(), Duration::from_secs(23));
+
+        // d inside the clip removes it
+        app.delete();
+        assert!(app.edits.edits.is_empty());
+        assert_eq!(app.duration(), Duration::from_secs(20));
+
+        // a missing recording is rejected and nothing is kept
+        app.seek_position(0);
+        app.open_prompt(PromptKind::InsertRecording);
+        app.prompt.as_mut().unwrap().input = "missing.cast".to_owned();
+        app.submit_prompt();
+        app.submit_prompt(); // range: all
+        assert!(app.message().unwrap().1, "should be an error");
+        assert!(app.edits.edits.is_empty());
+        assert_eq!(app.len(), 6);
+    }
+
+    #[test]
+    fn duplicate_selection() {
+        let (mut app, _d) = app();
+        app.seek_position(1);
+        app.toggle_selection();
+        app.seek_position(2);
+        app.duplicate_selection();
+
+        assert_eq!(
+            app.edits.edits,
+            [Edit::Insert {
+                at: 3,
+                clip: Clip::Recording {
+                    path: None,
+                    from: 1,
+                    to: Some(2)
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn retiming_still_targets_original_events_after_a_cut() {
+        let (mut app, _d) = app();
+        app.seek_position(0);
+        app.toggle_selection();
+        app.seek_position(1);
+        app.delete(); // cut events 0..1
+
+        // the playhead is at the cut's jump, whose pause is event 2's
+        assert_eq!(app.target_event(), Some(2));
+        app.set_delay(0.5);
+        assert!(app.edits.edits.contains(&Edit::SetDelay {
+            event: 2,
+            secs: 0.5
+        }));
     }
 
     #[test]

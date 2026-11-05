@@ -92,6 +92,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if let Some(prompt) = &mut app.prompt {
+        if prompt.kind == PromptKind::InsertMenu {
+            match key.code {
+                KeyCode::Char(c) => app.choose_insert(c),
+                _ => app.prompt = None,
+            }
+
+            return;
+        }
+
         match key.code {
             KeyCode::Enter => app.submit_prompt(),
             KeyCode::Esc => app.prompt = None,
@@ -150,6 +159,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => app.open_prompt(PromptKind::Cap),
         KeyCode::Char('s') => app.open_prompt(PromptKind::Scale),
         KeyCode::Char('u') => app.undo(),
+        KeyCode::Char('d') | KeyCode::Delete => app.delete(),
+        KeyCode::Char('D') => app.open_prompt(PromptKind::Restore),
+        KeyCode::Char('i') | KeyCode::Insert => app.open_prompt(PromptKind::InsertMenu),
         KeyCode::Char('r') if ctrl => app.redo(),
 
         // view

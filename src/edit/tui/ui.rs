@@ -12,6 +12,7 @@ use ratatui::Frame;
 
 use super::app::{App, Drag, TimelineMode};
 use crate::asciicast::{CursorShape, EventData};
+use crate::edit::timeline::Origin;
 use crate::tty::TtyTheme;
 
 /// Rows inside the timeline box: ruler, bars, ticks, playhead/markers.
@@ -22,6 +23,8 @@ const ACCENT: Color = Color::Yellow;
 const PLAYHEAD: Color = Color::Cyan;
 const MARKER: Color = Color::Magenta;
 const SELECTION_BG: Color = Color::Indexed(24);
+const CLIP: Color = Color::Magenta;
+const CUT: Color = Color::Red;
 const DIM: Color = Color::DarkGray;
 const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -346,11 +349,20 @@ fn in_selection(app: &App, event: usize) -> bool {
         .is_some_and(|(a, b)| (a..=b).contains(&event))
 }
 
+/// Playlist item being dragged.
 fn dragged_event(app: &App) -> Option<usize> {
     match app.drag {
-        Some(Drag::Event { event, .. }) => Some(event),
+        Some(Drag::Event { item, .. }) => Some(item),
         _ => None,
     }
+}
+
+fn is_clip(app: &App, i: usize) -> bool {
+    matches!(app.timeline.origin(i), Some(Origin::Clip { .. }))
+}
+
+fn is_cut(app: &App, i: usize) -> bool {
+    matches!(app.timeline.origin(i), Some(Origin::Cut { .. }))
 }
 
 // ---- timeline: time view --------------------------------------------------
@@ -424,6 +436,8 @@ fn draw_time_view(buf: &mut Buffer, area: Rect, app: &App) {
     let mut edited = vec![false; w as usize];
     let mut selected = vec![false; w as usize];
     let mut markers = vec![false; w as usize];
+    let mut clip = vec![false; w as usize];
+    let mut cut = vec![false; w as usize];
     let first = app
         .timeline
         .position_at(start.saturating_sub(Duration::from_nanos(1)));
@@ -439,10 +453,26 @@ fn draw_time_view(buf: &mut Buffer, area: Rect, app: &App) {
             break;
         }
 
+        // a clip covers the time from the item before it to itself
+        if is_clip(app, i) {
+            let prev = i
+                .checked_sub(1)
+                .and_then(|p| app.timeline.event(p))
+                .map_or(Duration::ZERO, |(pt, _)| pt);
+            let a = col_of(prev.max(start), window, w).unwrap_or(0) as usize;
+
+            if let Some(b) = col_of(t, window, w) {
+                for c in clip.iter_mut().take(b as usize + 1).skip(a) {
+                    *c = true;
+                }
+            }
+        }
+
         let Some(x) = col_of(t, window, w) else {
             continue;
         };
         let x = x as usize;
+        cut[x] |= is_cut(app, i);
         counts[x] += 1;
         edited[x] |= app.timeline.is_retimed(i);
         selected[x] |= in_selection(app, i);
@@ -459,6 +489,21 @@ fn draw_time_view(buf: &mut Buffer, area: Rect, app: &App) {
         if selected[x] {
             style = style.bg(SELECTION_BG);
             put(buf, area, x as u16, 1, ' ', style);
+        }
+
+        if clip[x] {
+            put(buf, area, x as u16, 1, '▒', style.fg(CLIP));
+        }
+
+        if cut[x] {
+            put(
+                buf,
+                area,
+                x as u16,
+                1,
+                '✂',
+                style.fg(CUT).add_modifier(Modifier::BOLD),
+            );
         }
 
         if counts[x] > 1 {
@@ -558,16 +603,19 @@ fn draw_event_view(buf: &mut Buffer, area: Rect, app: &App) {
             break;
         };
 
-        if i % 10 == 0 && x + 1 < w {
-            put(buf, area, x as u16, 0, '╷', Style::default().fg(DIM));
-            put_str(
-                buf,
-                area,
-                x as u16 + 1,
-                0,
-                &i.to_string(),
-                Style::default().fg(DIM),
-            );
+        // label original event numbers, which is what edits and the status refer to
+        if let Some(Origin::Event(e)) = app.timeline.origin(i) {
+            if e % 10 == 0 && x + 1 < w {
+                put(buf, area, x as u16, 0, '╷', Style::default().fg(DIM));
+                put_str(
+                    buf,
+                    area,
+                    x as u16 + 1,
+                    0,
+                    &e.to_string(),
+                    Style::default().fg(DIM),
+                );
+            }
         }
 
         let mut style = Style::default().fg(Color::Gray);
@@ -587,19 +635,14 @@ fn draw_event_view(buf: &mut Buffer, area: Rect, app: &App) {
         let delay = app.timeline.delay(i).unwrap_or_default();
         put(buf, area, x as u16, 1, bar(delay), style);
 
-        let glyph_style = match data {
-            EventData::Marker(_) => style.fg(MARKER),
-            _ => style,
+        let (glyph, glyph_style) = match (app.timeline.origin(i), data) {
+            (Some(Origin::Cut { .. }), _) => ('✂', style.fg(CUT).add_modifier(Modifier::BOLD)),
+            (Some(Origin::Clip { .. }), _) => ('▒', style.fg(CLIP)),
+            (_, EventData::Marker(_)) => (event_glyph(data), style.fg(MARKER)),
+            _ => (event_glyph(data), style),
         };
 
-        put(
-            buf,
-            area,
-            x as u16,
-            TICK_ROW,
-            event_glyph(data),
-            glyph_style,
-        );
+        put(buf, area, x as u16, TICK_ROW, glyph, glyph_style);
     }
 
     if let Some(x) = app.position.checked_sub(start).filter(|&x| x < w) {
@@ -653,7 +696,7 @@ fn status_line(app: &App) -> Line<'static> {
     }
 
     spans.push(sep());
-    spans.push(Span::raw(format!("event {}/{}", app.position, app.len())));
+    spans.push(Span::raw(format!("pos {}/{}", app.position, app.len())));
 
     if let Some(Drag::Event {
         event,
@@ -667,12 +710,26 @@ fn status_line(app: &App) -> Line<'static> {
             format!("dragging #{event}: {original_delay:.3}s → {new_delay:.3}s"),
             Style::default().fg(ACCENT),
         ));
+    } else if let Some(Origin::Clip { insert }) = app.timeline.origin(app.position) {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("in inserted clip #{insert} (d removes it)"),
+            Style::default().fg(CLIP),
+        ));
     } else if let Some(e) = app.target_event() {
-        let now = app.timeline.delay(e).unwrap_or_default();
-        let was = app.timeline.original_delay(e).unwrap_or_default();
+        let p = app.position;
+        let now = app.timeline.delay(p).unwrap_or_default();
+        let was = app.timeline.original_delay(p).unwrap_or_default();
         spans.push(sep());
 
-        if app.timeline.is_retimed(e) {
+        if let Some(Origin::Cut { from, to }) = app.timeline.origin(p) {
+            spans.push(Span::styled(
+                format!("✂ events {from}..{to} cut (D restores) "),
+                Style::default().fg(CUT),
+            ));
+        }
+
+        if app.timeline.is_retimed(p) {
             spans.push(Span::styled(
                 format!("pause before #{e}: {} → {} *", secs(was), secs(now)),
                 Style::default().fg(ACCENT),
@@ -731,6 +788,8 @@ fn help_line(app: &App) -> Line<'static> {
         ("c", "cap"),
         ("s", "scale"),
         ("u", "undo"),
+        ("d", "cut"),
+        ("i", "insert"),
         ("t", "view"),
         ("f", "full"),
         ("m", "metadata"),
@@ -772,6 +831,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("u / ctrl-r", "undo / redo"),
     ("drag a |", "change the pause before that event"),
     ("drag elsewhere", "scrub"),
+    ("Cut & insert", ""),
+    ("d / Delete", "cut selection (or the event/clip here)"),
+    ("D", "restore a cut (✂), or part of it"),
+    ("i", "insert: hold, blank, text, recording, copy"),
     ("View", ""),
     ("t", "switch time view / event view"),
     ("m", "metadata: title, idle limit, colors, cursor…"),
@@ -981,7 +1044,7 @@ mod tests {
         assert!(text.contains("file"));
         assert!(text.contains('|'));
         assert!(text.contains('▲'));
-        assert!(text.contains("event 4/6"));
+        assert!(text.contains("pos 4/6"));
         assert!(text.contains("▶ play"));
         assert!(
             text.contains("←→ step"),

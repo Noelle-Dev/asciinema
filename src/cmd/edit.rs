@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::asciicast::{self, CursorShape, EventData};
 use crate::cli;
-use crate::edit::{render, tui, Edit, EditList, Timeline};
+use crate::edit::timeline::Origin;
+use crate::edit::{render, tui, Clip, Edit, EditList, Timeline};
 use crate::status;
 
 impl cli::Edit {
@@ -22,8 +23,15 @@ impl cli::Edit {
             .edits
             .clone()
             .unwrap_or_else(|| EditList::sidecar_path(&path));
-        let mut edits = EditList::load_or_new(&edits_path, timeline.len())?;
+        if let Some(dir) = path.parent() {
+            timeline.set_clip_base(dir);
+        }
+
+        let mut edits = EditList::load_or_new(&edits_path, timeline.original_len())?;
         let changed = self.update_edits(&mut edits)?;
+
+        // build before saving, so an edit that can't be applied isn't kept
+        timeline.apply_edits(&edits)?;
 
         if changed {
             edits.save(&edits_path)?;
@@ -33,8 +41,6 @@ impl cli::Edit {
                 edits_path.display()
             );
         }
-
-        timeline.apply_edits(&edits);
 
         if self.list {
             print_events(&timeline)?;
@@ -91,6 +97,17 @@ impl cli::Edit {
             }
         }
 
+        for range in &self.restore {
+            let (from, to) = parse_range(range, n)?;
+
+            if edits.restore(from, to) {
+                status::info!("Restored events {from}..{to}");
+                changed = true;
+            } else {
+                status::warning!("Nothing is cut in {from}..{to}");
+            }
+        }
+
         let new_edits = self
             .set_delay
             .iter()
@@ -101,7 +118,36 @@ impl cli::Edit {
             .chain(self.cap_idle.iter().map(|s| {
                 parse_range_op(s, n).map(|(from, to, max)| Edit::CapIdle { from, to, max })
             }))
-            .chain(self.cursor.as_deref().map(parse_cursor));
+            .chain(self.cursor.as_deref().map(parse_cursor))
+            .chain(
+                self.delete
+                    .iter()
+                    .map(|s| parse_range(s, n).map(|(from, to)| Edit::Delete { from, to })),
+            )
+            .chain(self.insert_hold.iter().map(|s| {
+                parse_at_secs(s, n).map(|(at, secs)| Edit::Insert {
+                    at,
+                    clip: Clip::Hold { secs },
+                })
+            }))
+            .chain(self.insert_blank.iter().map(|s| {
+                parse_at_secs(s, n).map(|(at, secs)| Edit::Insert {
+                    at,
+                    clip: Clip::Blank { secs },
+                })
+            }))
+            .chain(self.insert_text.iter().map(|s| parse_insert_text(s, n)))
+            .chain(self.insert_cast.iter().map(|s| parse_insert_cast(s, n)))
+            .chain(self.duplicate.iter().map(|s| {
+                parse_range(s, n).map(|(from, to)| Edit::Insert {
+                    at: to + 1,
+                    clip: Clip::Recording {
+                        path: None,
+                        from,
+                        to: Some(to),
+                    },
+                })
+            }));
 
         for edit in new_edits {
             let edit = edit?;
@@ -177,8 +223,19 @@ fn print_events(timeline: &Timeline) -> Result<()> {
         let delay = timeline.delay(i).expect("index in range");
         let edited = if timeline.is_retimed(i) { "*" } else { " " };
 
+        // edits refer to original event numbers; synthetic items are labelled
+        let (label, note) = match timeline.origin(i) {
+            Some(Origin::Event(e)) => (e.to_string(), String::new()),
+            Some(Origin::Cut { from, to }) => (
+                "✂".to_owned(),
+                format!("[jump cut over events {from}..{to}] "),
+            ),
+            Some(Origin::Clip { insert }) => (format!("+clip{insert}"), String::new()),
+            None => (String::new(), String::new()),
+        };
+
         let (kind, preview) = match data {
-            EventData::Output(s) => ("output", preview(s)),
+            EventData::Output(s) => ("output", format!("{note}{}", preview(s))),
             EventData::Input(s) => ("input", preview(s)),
             EventData::Resize(c, r) => ("resize", format!("{c}x{r}")),
             EventData::Marker(s) => ("marker", preview(s)),
@@ -188,7 +245,7 @@ fn print_events(timeline: &Timeline) -> Result<()> {
 
         let line = writeln!(
             out,
-            "{i:>7}  {:>10}  {:>8}{edited}  {kind:<6}  {preview}",
+            "{label:>7}  {:>10}  {:>8}{edited}  {kind:<6}  {preview}",
             fmt_secs(time),
             fmt_secs(delay)
         );
@@ -282,7 +339,101 @@ pub(crate) fn describe(edit: &Edit) -> String {
         Edit::SetIdleTimeLimit { secs: None } => "remove the idle time limit".to_owned(),
         Edit::SetTheme { theme: Some(_) } => "change the color theme".to_owned(),
         Edit::SetTheme { theme: None } => "remove the color theme".to_owned(),
+        Edit::Delete { from, to } => format!("cut events {from}..{to}"),
+        Edit::Insert { at, ref clip } => format!("insert {} at {at}", clip.describe()),
     }
+}
+
+/// Parses `FROM..TO` (either end may be omitted) or a single index `N`.
+fn parse_range(s: &str, event_count: usize) -> Result<(usize, usize)> {
+    let (from, to, _) = parse_range_op(&format!("{s}=0"), event_count)?;
+
+    Ok((from, to))
+}
+
+/// Parses an insert position: an event index, or the event count for the end.
+fn parse_at(s: &str, event_count: usize) -> Result<usize> {
+    let at = s
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow!("invalid insert position '{s}'"))?;
+
+    if at > event_count {
+        bail!("insert position {at} out of range (0..={event_count})");
+    }
+
+    Ok(at)
+}
+
+/// Parses `AT=SECS`.
+fn parse_at_secs(s: &str, event_count: usize) -> Result<(usize, f64)> {
+    let (at, secs) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid argument '{s}', expected AT=SECS"))?;
+
+    let secs = secs
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid number of seconds '{secs}' in '{s}'"))?;
+
+    Ok((parse_at(at, event_count)?, secs))
+}
+
+/// Parses `AT=SECS:TEXT`, where `\n` in TEXT starts a new line.
+fn parse_insert_text(s: &str, event_count: usize) -> Result<Edit> {
+    let (head, text) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid --insert-text '{s}', expected AT=SECS:TEXT"))?;
+
+    let (at, secs) = parse_at_secs(head, event_count)?;
+    let text = text.replace("\\n", "\n");
+
+    Ok(Edit::Insert {
+        at,
+        clip: Clip::Text { text, secs },
+    })
+}
+
+/// Parses `AT=PATH` or `AT=PATH@FROM..TO`.
+fn parse_insert_cast(s: &str, event_count: usize) -> Result<Edit> {
+    let (at, rest) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid --insert-cast '{s}', expected AT=PATH[@FROM..TO]"))?;
+
+    let at = parse_at(at, event_count)?;
+
+    let (path, from, to) = match rest.rsplit_once('@') {
+        Some((path, range)) => {
+            let (a, b) = range
+                .split_once("..")
+                .ok_or_else(|| anyhow!("invalid range '{range}' in '{s}', expected FROM..TO"))?;
+
+            let num = |v: &str| {
+                v.trim()
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("invalid event index '{v}' in '{s}'"))
+            };
+            let from = if a.trim().is_empty() { 0 } else { num(a)? };
+            let to = if b.trim().is_empty() {
+                None
+            } else {
+                Some(num(b)?)
+            };
+
+            (path, from, to)
+        }
+
+        None => (rest, 0, None),
+    };
+
+    Ok(Edit::Insert {
+        at,
+        clip: Clip::Recording {
+            path: Some(path.to_owned()),
+            from,
+            to,
+        },
+    })
 }
 
 /// Parses a cursor shape name, or `default` to remove it.
@@ -375,7 +526,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{frame_text, parse_range_op, parse_set_delay};
-    use crate::asciicast;
+    use crate::asciicast::{self, EventData};
     use crate::cli;
     use crate::edit::Edit;
 
@@ -436,8 +587,66 @@ mod tests {
             render: None,
             render_in_place: false,
             cursor: None,
+            delete: vec![],
+            restore: vec![],
+            insert_hold: vec![],
+            insert_blank: vec![],
+            insert_text: vec![],
+            insert_cast: vec![],
+            duplicate: vec![],
             overwrite: false,
         }
+    }
+
+    #[test]
+    fn cut_and_insert_end_to_end() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("demo.cast");
+        let output = dir.path().join("out.cast");
+        fs::copy("tests/casts/full-v2.cast", &input).unwrap();
+        fs::copy("tests/casts/minimal-v3.cast", dir.path().join("other.cast")).unwrap();
+        let input_s = input.to_string_lossy().into_owned();
+
+        let mut cmd = edit_cmd(&input_s);
+        cmd.delete = vec!["1..1".to_owned()];
+        cmd.insert_text = vec!["0=1.5:Title\\nline two".to_owned()];
+        cmd.insert_cast = vec!["5=other.cast".to_owned()];
+        cmd.render = Some(output.to_string_lossy().into_owned());
+        cmd.run().unwrap();
+
+        let events: Vec<_> = asciicast::open_from_path(&output)
+            .unwrap()
+            .events
+            .map(|e| e.unwrap())
+            .collect();
+
+        let outputs: String = events
+            .iter()
+            .filter_map(|e| match &e.data {
+                EventData::Output(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(outputs.contains("Title") && outputs.contains("line two"));
+        assert!(outputs.contains("hello"), "other.cast's output is pasted");
+
+        // a bad edit is rejected and the edit list on disk is unchanged
+        let saved = fs::read_to_string(dir.path().join("demo.cast.edits.json")).unwrap();
+        let mut cmd = edit_cmd(&input_s);
+        cmd.insert_cast = vec!["0=missing.cast".to_owned()];
+        assert!(cmd.run().is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("demo.cast.edits.json")).unwrap(),
+            saved
+        );
+
+        // restoring the cut
+        let mut cmd = edit_cmd(&input_s);
+        cmd.restore = vec!["1..1".to_owned()];
+        cmd.run().unwrap();
+        let saved = fs::read_to_string(dir.path().join("demo.cast.edits.json")).unwrap();
+        assert!(!saved.contains("delete"));
     }
 
     #[test]

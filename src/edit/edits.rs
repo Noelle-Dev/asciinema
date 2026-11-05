@@ -44,6 +44,62 @@ pub enum Edit {
 
     /// Replace (or remove) the terminal color theme.
     SetTheme { theme: Option<ThemeColors> },
+
+    /// Cut events `from..=to`. Playback jumps straight to the screen as it
+    /// looked after the cut (a jump cut), so everything after stays intact.
+    Delete { from: usize, to: usize },
+
+    /// Insert a clip at position `at`: after `at` events, before event `at`.
+    /// When the clip ends, the screen is redrawn as it was before it.
+    Insert { at: usize, clip: Clip },
+}
+
+/// Something inserted into the timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Clip {
+    /// Freeze the current screen.
+    Hold { secs: f64 },
+
+    /// A cleared screen.
+    Blank { secs: f64 },
+
+    /// Text centered on a cleared screen.
+    Text { text: String, secs: f64 },
+
+    /// Events `from..=to` (`to` omitted: to the end) of another recording,
+    /// or of this one when `path` is omitted.
+    Recording {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        from: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<usize>,
+    },
+}
+
+impl Clip {
+    pub fn describe(&self) -> String {
+        match self {
+            Clip::Hold { secs } => format!("hold for {secs}s"),
+            Clip::Blank { secs } => format!("blank screen for {secs}s"),
+            Clip::Text { text, secs } => {
+                let first = text.lines().next().unwrap_or("");
+                format!("text \"{first}\" for {secs}s")
+            }
+            Clip::Recording { path, from, to } => {
+                let range = match to {
+                    Some(to) => format!("{from}..{to}"),
+                    None => format!("{from}.."),
+                };
+
+                match path {
+                    Some(p) => format!("events {range} of {p}"),
+                    None => format!("copy of events {range}"),
+                }
+            }
+        }
+    }
 }
 
 /// A color theme as stored in the edit list, with `#rrggbb` colors.
@@ -119,7 +175,11 @@ pub fn apply_header(original: &Header, edits: &[Edit]) -> Header {
                 header.term_theme = theme.as_ref().and_then(|t| t.to_tty().ok());
             }
 
-            Edit::SetDelay { .. } | Edit::Scale { .. } | Edit::CapIdle { .. } => {}
+            Edit::SetDelay { .. }
+            | Edit::Scale { .. }
+            | Edit::CapIdle { .. }
+            | Edit::Delete { .. }
+            | Edit::Insert { .. } => {}
         }
     }
 
@@ -216,7 +276,10 @@ impl EditList {
                 .edits
                 .retain(|e| !matches!(*e, Edit::SetDelay { event: other, .. } if other == event)),
 
-            Edit::Scale { .. } | Edit::CapIdle { .. } => {}
+            Edit::Scale { .. }
+            | Edit::CapIdle { .. }
+            | Edit::Delete { .. }
+            | Edit::Insert { .. } => {}
 
             // header edits: one of each kind
             _ => {
@@ -233,6 +296,48 @@ impl EditList {
 
     pub fn undo(&mut self) -> Option<Edit> {
         self.edits.pop()
+    }
+
+    /// Un-cuts events `from..=to`: shrinks or splits the delete edits covering
+    /// them. Returns whether anything was restored.
+    pub fn restore(&mut self, from: usize, to: usize) -> bool {
+        let mut changed = false;
+        let mut out = Vec::with_capacity(self.edits.len());
+
+        for edit in self.edits.drain(..) {
+            match edit {
+                Edit::Delete { from: a, to: b } if a <= to && from <= b => {
+                    changed = true;
+
+                    if a < from {
+                        out.push(Edit::Delete {
+                            from: a,
+                            to: from - 1,
+                        });
+                    }
+
+                    if b > to {
+                        out.push(Edit::Delete {
+                            from: to + 1,
+                            to: b,
+                        });
+                    }
+                }
+
+                other => out.push(other),
+            }
+        }
+
+        self.edits = out;
+
+        changed
+    }
+
+    /// Whether original event `i` is cut.
+    pub fn is_deleted(&self, i: usize) -> bool {
+        self.edits
+            .iter()
+            .any(|e| matches!(*e, Edit::Delete { from, to } if (from..=to).contains(&i)))
     }
 }
 
@@ -304,6 +409,53 @@ impl Edit {
                 }
 
                 Ok(())
+            }
+
+            Edit::Delete { from, to } => check_range(from, to),
+
+            Edit::Insert { at, ref clip } => {
+                if at > event_count {
+                    bail!("insert position {at} out of range (0..={event_count})");
+                }
+
+                match clip {
+                    Clip::Hold { secs } | Clip::Blank { secs } | Clip::Text { secs, .. } => {
+                        if !secs.is_finite() || *secs <= 0.0 {
+                            bail!("clip duration must be a positive number of seconds, got {secs}");
+                        }
+                    }
+
+                    Clip::Recording { .. } => {}
+                }
+
+                match clip {
+                    Clip::Text { text, .. } if text.trim().is_empty() => {
+                        bail!("a text clip needs some text")
+                    }
+
+                    Clip::Recording {
+                        from, to: Some(to), ..
+                    } if from > to => {
+                        bail!("invalid event range {from}..{to}: start is after end")
+                    }
+
+                    Clip::Recording {
+                        path: None,
+                        from,
+                        to,
+                        ..
+                    } => {
+                        check_index(*from)?;
+
+                        if let Some(to) = to {
+                            check_index(*to)?;
+                        }
+
+                        Ok(())
+                    }
+
+                    _ => Ok(()),
+                }
             }
         }
     }
@@ -598,6 +750,122 @@ mod tests {
         assert_eq!(parse_hex("#0c0c0"), None);
         assert_eq!(parse_hex("#0c0c0g"), None);
         assert_eq!(to_hex(rgb::RGB8::new(255, 0, 16)), "#ff0010");
+    }
+
+    #[test]
+    fn delete_and_restore() {
+        let mut list = EditList::new(20);
+        list.push(Edit::Delete { from: 5, to: 10 }).unwrap();
+        list.push(Edit::SetDelay {
+            event: 7,
+            secs: 1.0,
+        })
+        .unwrap();
+        assert!(list.is_deleted(5) && list.is_deleted(10) && !list.is_deleted(11));
+
+        // restoring the middle splits the cut
+        assert!(list.restore(7, 8));
+        assert_eq!(
+            list.edits,
+            [
+                Edit::Delete { from: 5, to: 6 },
+                Edit::Delete { from: 9, to: 10 },
+                Edit::SetDelay {
+                    event: 7,
+                    secs: 1.0
+                },
+            ]
+        );
+
+        // restoring a range covering both removes them
+        assert!(list.restore(0, 19));
+        assert_eq!(
+            list.edits,
+            [Edit::SetDelay {
+                event: 7,
+                secs: 1.0
+            }]
+        );
+        assert!(!list.restore(0, 19));
+
+        assert!(list.push(Edit::Delete { from: 3, to: 2 }).is_err());
+        assert!(list.push(Edit::Delete { from: 0, to: 20 }).is_err());
+    }
+
+    #[test]
+    fn insert_validation_and_json() {
+        use super::Clip;
+
+        let mut list = EditList::new(10);
+        let ok = [
+            Clip::Hold { secs: 1.0 },
+            Clip::Blank { secs: 0.5 },
+            Clip::Text {
+                text: "Hi".to_owned(),
+                secs: 2.0,
+            },
+            Clip::Recording {
+                path: None,
+                from: 2,
+                to: Some(4),
+            },
+            Clip::Recording {
+                path: Some("other.cast".to_owned()),
+                from: 0,
+                to: None,
+            },
+        ];
+
+        for clip in ok {
+            list.push(Edit::Insert { at: 10, clip }).unwrap();
+        }
+
+        assert_eq!(list.edits.len(), 5, "inserts never coalesce");
+
+        let bad = [
+            (11, Clip::Hold { secs: 1.0 }),
+            (0, Clip::Hold { secs: 0.0 }),
+            (
+                0,
+                Clip::Text {
+                    text: "  ".to_owned(),
+                    secs: 1.0,
+                },
+            ),
+            (
+                0,
+                Clip::Recording {
+                    path: None,
+                    from: 4,
+                    to: Some(2),
+                },
+            ),
+            (
+                0,
+                Clip::Recording {
+                    path: None,
+                    from: 0,
+                    to: Some(10),
+                },
+            ),
+        ];
+
+        for (at, clip) in bad {
+            assert!(
+                list.push(Edit::Insert {
+                    at,
+                    clip: clip.clone()
+                })
+                .is_err(),
+                "{clip:?}"
+            );
+        }
+
+        let json = serde_json::to_value(&list.edits[3]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"op": "insert", "at": 10, "clip": {"kind": "recording", "from": 2, "to": 4}})
+        );
     }
 
     #[test]

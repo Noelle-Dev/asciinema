@@ -246,6 +246,12 @@ pub enum Commands {
   asciinema edit demo.cast --cap-idle 0..999=1.5
       Caps every pause in events 0 to 999 at 1.5s
 
+  asciinema edit demo.cast --delete 40..95
+      Cuts events 40 to 95, jumping straight to the screen after them
+
+  asciinema edit demo.cast --insert-text '0=3:My demo\\nPart 1'
+      Opens with a 3-second title card
+
   asciinema edit demo.cast --cursor block
       Plays the recording back with a steady block cursor
 
@@ -730,6 +736,59 @@ pub struct Edit {
         long_help
     )]
     pub cap_idle: Vec<String>,
+
+    /// Cut events FROM..TO (inclusive) as a jump cut: playback goes straight to the screen as it looked after them. Can be given multiple times.
+    #[arg(
+        long,
+        value_name = "FROM..TO",
+        help = "Cut a range of events",
+        long_help
+    )]
+    pub delete: Vec<String>,
+
+    /// Un-cut events FROM..TO, shrinking or splitting the cuts covering them. Applied before new edits. Can be given multiple times.
+    #[arg(long, value_name = "FROM..TO", help = "Restore cut events", long_help)]
+    pub restore: Vec<String>,
+
+    /// Insert a pause that holds the current screen for SECS seconds, before event AT (use the event count to insert at the end).
+    #[arg(long, value_name = "AT=SECS", help = "Insert a screen hold", long_help)]
+    pub insert_hold: Vec<String>,
+
+    /// Insert a cleared screen shown for SECS seconds, before event AT.
+    #[arg(
+        long,
+        value_name = "AT=SECS",
+        help = "Insert a blank screen",
+        long_help
+    )]
+    pub insert_blank: Vec<String>,
+
+    /// Insert a text card: TEXT centered on a cleared screen for SECS seconds, before event AT. Use \n in TEXT for a new line.
+    #[arg(
+        long,
+        value_name = "AT=SECS:TEXT",
+        help = "Insert a text card",
+        long_help
+    )]
+    pub insert_text: Vec<String>,
+
+    /// Insert events of another recording before event AT: all of them, or just FROM..TO. PATH is relative to this recording's directory.
+    #[arg(
+        long,
+        value_name = "AT=PATH[@FROM..TO]",
+        help = "Insert another recording",
+        long_help
+    )]
+    pub insert_cast: Vec<String>,
+
+    /// Copy events FROM..TO of this recording and insert the copy right after them.
+    #[arg(
+        long,
+        value_name = "FROM..TO",
+        help = "Duplicate a range of events",
+        long_help
+    )]
+    pub duplicate: Vec<String>,
 
     /// Store a cursor shape in the recording's header. When the recording is played back with asciinema, the terminal's cursor is switched to this shape for the duration of playback and restored to the terminal's default afterwards. Use 'default' to remove the setting. Takes effect when rendering.
     #[arg(

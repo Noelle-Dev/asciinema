@@ -228,7 +228,8 @@ fn preview_cursor(app: &mut App, shape: Option<CursorShape>) {
 
 /// Drops any uncommitted preview, back to what the edit list says.
 fn revert_preview(app: &mut App) {
-    app.timeline.apply_edits(&app.edits);
+    // header-only previews never change the playlist's structure, so this can't fail
+    let _ = app.timeline.apply_edits(&app.edits);
 }
 
 /// Leaves a picker: back to the list, or closes the panel if opened directly.

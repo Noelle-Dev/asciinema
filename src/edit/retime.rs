@@ -76,6 +76,9 @@ pub fn apply(original_times: &[Duration], edits: &[Edit]) -> Vec<Duration> {
             | Edit::SetCommand { .. }
             | Edit::SetIdleTimeLimit { .. }
             | Edit::SetTheme { .. } => {}
+
+            // structural edits are handled when the playlist is built
+            Edit::Delete { .. } | Edit::Insert { .. } => {}
         }
     }
 

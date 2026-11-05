@@ -12,5 +12,5 @@ pub mod themes;
 pub mod timeline;
 pub mod tui;
 
-pub use edits::{Edit, EditList};
+pub use edits::{Clip, Edit, EditList};
 pub use timeline::Timeline;

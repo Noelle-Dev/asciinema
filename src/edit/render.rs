@@ -157,7 +157,7 @@ mod tests {
             })
             .unwrap();
         edits.save(&sidecar).unwrap();
-        tl.apply_edits(&edits);
+        tl.apply_edits(&edits).unwrap();
 
         let backup = render_in_place(&tl, &src, &sidecar).unwrap();
 
