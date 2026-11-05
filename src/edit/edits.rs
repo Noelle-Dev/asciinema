@@ -103,11 +103,23 @@ impl EditList {
     }
 
     /// Validates `edit` against this recording, then appends it.
-    pub fn push(&mut self, edit: Edit) -> Result<()> {
+    ///
+    /// A `SetDelay` sets an absolute value, so it makes any earlier `SetDelay`
+    /// of the same event redundant; those are removed rather than piling up.
+    /// Returns whether an earlier edit was replaced.
+    pub fn push(&mut self, edit: Edit) -> Result<bool> {
         edit.validate(self.event_count)?;
+        let len = self.edits.len();
+
+        if let Edit::SetDelay { event, .. } = edit {
+            self.edits
+                .retain(|e| !matches!(*e, Edit::SetDelay { event: other, .. } if other == event));
+        }
+
+        let replaced = self.edits.len() != len;
         self.edits.push(edit);
 
-        Ok(())
+        Ok(replaced)
     }
 
     pub fn undo(&mut self) -> Option<Edit> {
@@ -292,6 +304,56 @@ mod tests {
             })
             .is_ok());
         assert_eq!(list.edits.len(), 1);
+    }
+
+    #[test]
+    fn set_delay_replaces_earlier_set_delay_of_same_event() {
+        let mut list = EditList::new(10);
+
+        assert!(!list
+            .push(Edit::SetDelay {
+                event: 3,
+                secs: 1.0
+            })
+            .unwrap());
+        assert!(!list
+            .push(Edit::CapIdle {
+                from: 0,
+                to: 9,
+                max: 2.0
+            })
+            .unwrap());
+        assert!(!list
+            .push(Edit::SetDelay {
+                event: 4,
+                secs: 1.0
+            })
+            .unwrap());
+        assert!(list
+            .push(Edit::SetDelay {
+                event: 3,
+                secs: 5.0
+            })
+            .unwrap());
+
+        assert_eq!(
+            list.edits,
+            [
+                Edit::CapIdle {
+                    from: 0,
+                    to: 9,
+                    max: 2.0
+                },
+                Edit::SetDelay {
+                    event: 4,
+                    secs: 1.0
+                },
+                Edit::SetDelay {
+                    event: 3,
+                    secs: 5.0
+                },
+            ]
+        );
     }
 
     #[test]

@@ -86,8 +86,12 @@ impl cli::Edit {
         for edit in new_edits {
             let edit = edit?;
             let description = describe(&edit);
-            edits.push(edit)?;
-            status::info!("Added {description}");
+
+            if edits.push(edit)? {
+                status::info!("Replaced earlier delay of the same event: {description}");
+            } else {
+                status::info!("Added {description}");
+            }
             changed = true;
         }
 
@@ -240,24 +244,37 @@ fn print_frame(timeline: &Timeline, secs: f64) -> Result<()> {
     let t = Duration::from_secs_f64(secs);
     let position = timeline.position_at(t);
     let vt = timeline.vt_at_position(position);
-    let (cols, _) = vt.size();
-    let rule = "─".repeat(cols);
+    let (cols, rows) = vt.size();
 
-    println!(
-        "┌{rule}┐ {} (after event {})",
+    // Metadata goes to stderr so stdout is just the screen text, safe to pipe or diff.
+    status::info!(
+        "Frame at {} (after event {}), {cols}x{rows}",
         fmt_secs(t),
         position
             .checked_sub(1)
             .map_or("-".to_owned(), |p| p.to_string())
     );
 
-    for line in vt.text() {
-        println!("│{line:<cols$}│");
-    }
-
-    println!("└{rule}┘");
+    print!("{}", frame_text(&vt.text()));
 
     Ok(())
+}
+
+/// Screen lines with trailing whitespace and trailing blank rows removed, so
+/// wide recordings don't wrap in a narrower terminal.
+fn frame_text(lines: &[String]) -> String {
+    let lines: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
+    let used = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(0, |i| i + 1);
+
+    lines[..used].iter().fold(String::new(), |mut out, l| {
+        out.push_str(l);
+        out.push('\n');
+
+        out
+    })
 }
 
 fn preview(s: &str) -> String {
@@ -365,7 +382,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{parse_range_op, parse_set_delay};
+    use super::{frame_text, parse_range_op, parse_set_delay};
     use crate::asciicast;
     use crate::cli;
     use crate::edit::Edit;
@@ -398,6 +415,20 @@ mod tests {
         assert_eq!(parse_range_op("..=1", 10).unwrap(), (0, 9, 1.0));
         assert_eq!(parse_range_op("7=2", 10).unwrap(), (7, 7, 2.0));
         assert!(parse_range_op("1..2", 10).is_err());
+    }
+
+    #[test]
+    fn frame_text_trims_padding_and_blank_rows() {
+        let lines = vec![
+            "$ echo hi    ".to_owned(),
+            "".to_owned(),
+            "hi       ".to_owned(),
+            "     ".to_owned(),
+            "".to_owned(),
+        ];
+
+        assert_eq!(frame_text(&lines), "$ echo hi\n\nhi\n");
+        assert_eq!(frame_text(&["  ".to_owned()]), "");
     }
 
     fn edit_cmd(file: &str) -> cli::Edit {
