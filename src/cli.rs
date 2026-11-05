@@ -215,6 +215,39 @@ pub enum Commands {
       Downloads a remote recording and converts it to the latest asciicast format (v3)"
     )]
     Convert(Convert),
+
+    /// Edit a recording non-destructively.
+    ///
+    /// Edits are stored in a sidecar edit list next to the recording (by default <FILE>.edits.json) and never modify the original file. Use --render to produce a new recording with all edits applied.
+    ///
+    /// Events are addressed by index (see --list). The delay of event N is the time between event N-1 and event N. Ranges are inclusive and written FROM..TO.
+    #[clap(
+        about = "Edit a recording (timing, scrubbing)",
+        long_about,
+        after_help = "\x1b[1;4mExamples\x1b[0m:
+
+  asciinema edit demo.cast --list
+      Lists events with their index, time and delay
+
+  asciinema edit demo.cast --frame 12.5
+      Prints the screen as it looks at 12.5s (with edits applied)
+
+  asciinema edit demo.cast --set-delay 42=0.3
+      Shortens (or elongates) the pause before event 42 to 0.3s
+
+  asciinema edit demo.cast --scale 100..200=0.5
+      Plays events 100 to 200 at double speed
+
+  asciinema edit demo.cast --cap-idle 0..999=1.5
+      Caps every pause in events 0 to 999 at 1.5s
+
+  asciinema edit demo.cast --undo
+      Removes the most recent edit
+
+  asciinema edit demo.cast --render edited.cast
+      Writes a new recording with all edits applied"
+    )]
+    Edit(Edit),
 }
 
 #[derive(Debug, Args)]
@@ -612,6 +645,82 @@ pub struct Convert {
     #[arg(
         long,
         help = "Overwrite the output file if it already exists",
+        long_help
+    )]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct Edit {
+    /// The recording to edit. Must be a local file, since the edit list is stored next to it.
+    pub file: String,
+
+    /// Path of the edit list file. Defaults to the recording path with an .edits.json suffix appended.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Edit list file [default: <FILE>.edits.json]",
+        long_help
+    )]
+    pub edits: Option<PathBuf>,
+
+    /// Print all events with their index, (edited) time, (edited) delay, type and a preview of their data.
+    #[arg(long, help = "List events", long_help)]
+    pub list: bool,
+
+    /// Print the screen contents at the given time in seconds, on the edited timeline.
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Print the screen at a given time",
+        long_help
+    )]
+    pub frame: Option<f64>,
+
+    /// Set the delay before event EVENT to SECS seconds. Can be given multiple times.
+    #[arg(
+        long,
+        value_name = "EVENT=SECS",
+        help = "Set the delay before an event",
+        long_help
+    )]
+    pub set_delay: Vec<String>,
+
+    /// Multiply delays of events FROM..TO (inclusive) by FACTOR. A factor below 1 speeds up, above 1 slows down. Can be given multiple times.
+    #[arg(
+        long,
+        value_name = "FROM..TO=FACTOR",
+        help = "Scale delays in a range of events",
+        long_help
+    )]
+    pub scale: Vec<String>,
+
+    /// Cap delays of events FROM..TO (inclusive) at SECS seconds. Can be given multiple times.
+    #[arg(
+        long,
+        value_name = "FROM..TO=SECS",
+        help = "Cap idle time in a range of events",
+        long_help
+    )]
+    pub cap_idle: Vec<String>,
+
+    /// Remove the most recent edit from the edit list. Applied before any new edits given in the same invocation.
+    #[arg(long, help = "Remove the most recent edit", long_help)]
+    pub undo: bool,
+
+    /// Write a new recording (asciicast v3) with all edits applied. A .zst suffix enables zstd compression. Use '-' for stdout.
+    #[arg(
+        long,
+        value_name = "OUTPUT",
+        help = "Render the edited recording to a file",
+        long_help
+    )]
+    pub render: Option<String>,
+
+    /// Overwrite the --render output file if it already exists.
+    #[arg(
+        long,
+        help = "Overwrite the render output file if it exists",
         long_help
     )]
     pub overwrite: bool,

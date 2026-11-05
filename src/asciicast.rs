@@ -44,11 +44,13 @@ pub struct Header {
     pub env: Option<HashMap<String, String>>,
 }
 
+#[derive(Clone)]
 pub struct Event {
     pub time: Duration,
     pub data: EventData,
 }
 
+#[derive(Clone)]
 pub enum EventData {
     Output(String),
     Input(String),

@@ -4,6 +4,7 @@ mod asciicast;
 mod cli;
 mod cmd;
 mod config;
+mod edit;
 mod encoder;
 mod fd;
 mod file_output;
@@ -99,6 +100,7 @@ fn main() -> ExitCode {
         Commands::Play(cmd) => cmd.run().report(),
         Commands::Cat(cmd) => cmd.run().report(),
         Commands::Convert(cmd) => cmd.run().report(),
+        Commands::Edit(cmd) => cmd.run().report(),
         Commands::Upload(cmd) => cmd.run().report(),
         Commands::Auth(cmd) => cmd.run().report(),
     }
