@@ -272,6 +272,16 @@ pub(crate) fn describe(edit: &Edit) -> String {
         Edit::CapIdle { from, to, max } => format!("cap delays of events {from}..{to} at {max}s"),
         Edit::SetCursor { shape: Some(s) } => format!("set cursor shape to {}", s.name()),
         Edit::SetCursor { shape: None } => "use the terminal's default cursor shape".to_owned(),
+        Edit::SetTitle { title: Some(ref t) } => format!("set title to \"{t}\""),
+        Edit::SetTitle { title: None } => "remove the title".to_owned(),
+        Edit::SetCommand {
+            command: Some(ref c),
+        } => format!("set command to \"{c}\""),
+        Edit::SetCommand { command: None } => "remove the command".to_owned(),
+        Edit::SetIdleTimeLimit { secs: Some(s) } => format!("set idle time limit to {s}s"),
+        Edit::SetIdleTimeLimit { secs: None } => "remove the idle time limit".to_owned(),
+        Edit::SetTheme { theme: Some(_) } => "change the color theme".to_owned(),
+        Edit::SetTheme { theme: None } => "remove the color theme".to_owned(),
     }
 }
 

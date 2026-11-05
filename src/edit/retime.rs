@@ -70,8 +70,12 @@ pub fn apply(original_times: &[Duration], edits: &[Edit]) -> Vec<Duration> {
                 }
             }
 
-            // not a timing edit
-            Edit::SetCursor { .. } => {}
+            // header edits don't affect timing
+            Edit::SetCursor { .. }
+            | Edit::SetTitle { .. }
+            | Edit::SetCommand { .. }
+            | Edit::SetIdleTimeLimit { .. }
+            | Edit::SetTheme { .. } => {}
         }
     }
 

@@ -40,6 +40,9 @@ pub enum PromptKind {
     Goto,
     RenderTo,
     ConfirmRenderInPlace,
+    Title,
+    Command,
+    IdleLimit,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +105,8 @@ pub struct App {
     pub auto_scroll_offset: Cell<(usize, usize)>,
 
     pub selection_anchor: Option<usize>,
+    /// Metadata side panel, when open.
+    pub meta: Option<super::meta::Panel>,
     pub prompt: Option<Prompt>,
     pub drag: Option<Drag>,
     message: Option<(String, bool, Instant)>,
@@ -133,6 +138,7 @@ impl App {
             pan: None,
             auto_scroll_offset: Cell::new((0, 0)),
             selection_anchor: None,
+            meta: None,
             prompt: None,
             drag: None,
             message: None,
@@ -495,27 +501,6 @@ impl App {
 
     // ---- view ---------------------------------------------------------
 
-    /// Cycles the recording's cursor shape: default, then each shape.
-    pub fn cycle_cursor(&mut self) {
-        use crate::asciicast::CursorShape::*;
-
-        let order = [
-            None,
-            Some(Block),
-            Some(BlinkingBlock),
-            Some(Bar),
-            Some(BlinkingBar),
-            Some(Underline),
-            Some(BlinkingUnderline),
-        ];
-        let current = self.timeline.header.term_cursor;
-        let i = order.iter().position(|&s| s == current).unwrap_or(0);
-
-        self.commit(Edit::SetCursor {
-            shape: order[(i + 1) % order.len()],
-        });
-    }
-
     pub fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             TimelineMode::Time => TimelineMode::Event,
@@ -615,6 +600,15 @@ impl App {
                 .map(|e| format!("{:.3}", self.delay_secs(e)))
                 .unwrap_or_default(),
 
+            PromptKind::Title => self.timeline.header.title.clone().unwrap_or_default(),
+            PromptKind::Command => self.timeline.header.command.clone().unwrap_or_default(),
+            PromptKind::IdleLimit => self
+                .timeline
+                .header
+                .idle_time_limit
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+
             _ => String::new(),
         };
 
@@ -649,6 +643,23 @@ impl App {
             PromptKind::Goto => match number() {
                 Some(v) if v >= 0.0 => self.seek_time(Duration::from_secs_f64(v)),
                 _ => self.error(format!("not a time: '{input}'")),
+            },
+
+            PromptKind::Title => self.commit(Edit::SetTitle {
+                title: (!input.is_empty()).then(|| input.to_owned()),
+            }),
+
+            PromptKind::Command => self.commit(Edit::SetCommand {
+                command: (!input.is_empty()).then(|| input.to_owned()),
+            }),
+
+            PromptKind::IdleLimit => match input {
+                "" | "none" => self.commit(Edit::SetIdleTimeLimit { secs: None }),
+
+                _ => match number() {
+                    Some(v) => self.commit(Edit::SetIdleTimeLimit { secs: Some(v) }),
+                    None => self.error(format!("not a number: '{input}'")),
+                },
             },
 
             PromptKind::RenderTo => {
@@ -690,6 +701,9 @@ impl App {
             PromptKind::Scale => format!("Scale pauses in {scope} by: "),
             PromptKind::Goto => "Go to time (secs): ".to_owned(),
             PromptKind::RenderTo => "Render to file: ".to_owned(),
+            PromptKind::Title => "Title (empty to remove): ".to_owned(),
+            PromptKind::Command => "Command (empty to remove): ".to_owned(),
+            PromptKind::IdleLimit => "Idle time limit in secs (empty to remove): ".to_owned(),
 
             PromptKind::ConfirmRenderInPlace => format!(
                 "Overwrite {} with {} edit(s)? Previous version kept as .bak [y/N]: ",
@@ -849,36 +863,6 @@ pub(crate) mod tests {
         // the playhead stays on the same frame after a retime
         assert_eq!(app.position, 2);
         assert_eq!(app.time, Duration::from_secs(2));
-    }
-
-    #[test]
-    fn cycle_cursor_is_one_undoable_edit() {
-        use crate::asciicast::CursorShape;
-
-        let (mut app, _d) = app();
-        assert_eq!(app.timeline.header.term_cursor, None);
-
-        app.cycle_cursor();
-        assert_eq!(app.timeline.header.term_cursor, Some(CursorShape::Block));
-        app.cycle_cursor();
-        assert_eq!(
-            app.timeline.header.term_cursor,
-            Some(CursorShape::BlinkingBlock)
-        );
-        assert_eq!(app.edits.edits.len(), 1, "cursor edits coalesce");
-
-        app.undo();
-        assert_eq!(app.timeline.header.term_cursor, Some(CursorShape::Block));
-
-        // 7 shapes including default: 7 presses come back around
-        for _ in 0..7 {
-            app.cycle_cursor();
-        }
-        assert_eq!(
-            app.timeline.header.term_cursor,
-            Some(CursorShape::Block),
-            "wraps around"
-        );
     }
 
     #[test]

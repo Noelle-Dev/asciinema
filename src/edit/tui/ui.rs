@@ -33,6 +33,8 @@ pub struct Areas {
     pub timeline: Rect,
     /// Clickable play/pause button in the status bar (empty in full screen).
     pub play_button: Rect,
+    /// Inside of the metadata panel, when open.
+    pub meta: Rect,
 }
 
 pub fn draw(frame: &mut Frame, app: &App) -> Areas {
@@ -54,6 +56,24 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         Constraint::Length(1),
     ])
     .areas(area);
+
+    // The metadata panel sits beside the preview so changes are visible live;
+    // on narrow terminals it takes the preview's place.
+    let (preview_box, meta_box) = if app.meta.is_some() {
+        if preview_box.width >= super::meta::PANEL_WIDTH + 24 {
+            let [p, m] = Layout::horizontal([
+                Constraint::Min(20),
+                Constraint::Length(super::meta::PANEL_WIDTH),
+            ])
+            .areas(preview_box);
+
+            (p, Some(m))
+        } else {
+            (Rect::default(), Some(preview_box))
+        }
+    } else {
+        (preview_box, None)
+    };
 
     let preview_block = Block::default()
         .borders(Borders::ALL)
@@ -96,10 +116,15 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
         ..status
     };
 
+    let meta = meta_box.map_or(Rect::default(), |m| {
+        super::meta::draw(frame.buffer_mut(), m, app)
+    });
+
     Areas {
         preview,
         timeline,
         play_button,
+        meta,
     }
 }
 
@@ -677,7 +702,20 @@ fn help_line(app: &App) -> Line<'static> {
     }
 
     // Messages temporarily replace the key hints, which are always in `?`.
-    if let Some((msg, is_error)) = app.message() {
+    let message = app.message();
+
+    if let (Some(panel), None) = (&app.meta, message) {
+        let mut spans = Vec::new();
+
+        for (k, what) in super::meta::hints(panel) {
+            spans.push(Span::styled(*k, Style::default().fg(PLAYHEAD)));
+            spans.push(Span::styled(format!(" {what}  "), Style::default().fg(DIM)));
+        }
+
+        return Line::from(spans);
+    }
+
+    if let Some((msg, is_error)) = message {
         let color = if is_error { Color::Red } else { Color::Green };
 
         return Line::from(Span::styled(msg.to_owned(), Style::default().fg(color)));
@@ -695,6 +733,7 @@ fn help_line(app: &App) -> Line<'static> {
         ("u", "undo"),
         ("t", "view"),
         ("f", "full"),
+        ("m", "metadata"),
         ("?", "help"),
         ("q", "quit"),
     ];
@@ -735,7 +774,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("drag elsewhere", "scrub"),
     ("View", ""),
     ("t", "switch time view / event view"),
-    ("C", "cycle the cursor shape stored in the recording"),
+    ("m", "metadata: title, idle limit, colors, cursor…"),
+    ("C", "choose the cursor shape for playback"),
     ("( / ) or ctrl-wheel", "zoom timeline in / out (time view)"),
     ("h j k l / H J K L", "pan the preview (by 1 / by 10)"),
     ("0", "auto-scroll to the recorded cursor (undoes hjkl)"),

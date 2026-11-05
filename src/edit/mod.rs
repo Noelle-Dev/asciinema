@@ -8,6 +8,7 @@
 pub mod edits;
 pub mod render;
 pub mod retime;
+pub mod themes;
 pub mod timeline;
 pub mod tui;
 

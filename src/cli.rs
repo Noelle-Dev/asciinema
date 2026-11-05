@@ -348,6 +348,10 @@ pub struct Record {
     #[arg(long, help = "Return the session's exit status", long_help)]
     pub return_: bool,
 
+    /// Clear the terminal screen before the session starts, so what you see live starts at the top-left exactly as the recording will. Without it, the shell starts wherever your cursor was, but plays back from the top.
+    #[arg(long, help = "Clear the screen before starting", long_help)]
+    pub clear: bool,
+
     /// Enable logging of internal events to a file at the specified path. Useful for debugging recording issues.
     #[arg(long, value_name = "PATH", help = "Log file path", long_help)]
     pub log_file: Option<PathBuf>,
@@ -403,6 +407,14 @@ pub struct Play {
         long_help
     )]
     pub resize: bool,
+
+    /// Don't apply the recording's color theme to your terminal. By default, if the recording has a theme, your terminal's colors (foreground, background and the 16-color palette) are switched to it for the duration of playback and restored afterwards.
+    #[arg(long, help = "Keep your terminal's colors during playback", long_help)]
+    pub ignore_theme: bool,
+
+    /// Clear the terminal screen before playback starts (and before each repetition with --loop). The last frame stays on screen when playback ends.
+    #[arg(long, help = "Clear the screen before playing", long_help)]
+    pub clear: bool,
 }
 
 #[derive(Debug, Args)]
@@ -613,6 +625,10 @@ pub struct Session {
     /// Make the asciinema command exit with the same status code as the session command. By default, asciinema exits with status 0 regardless of what happens in the session. With this option, if the session command exits with a non-zero status, asciinema will also exit with that same status.
     #[arg(long, help = "Return the session's exit status", long_help)]
     pub return_: bool,
+
+    /// Clear the terminal screen before the session starts, so what you see live starts at the top-left exactly as the recording will. Without it, the shell starts wherever your cursor was, but plays back from the top.
+    #[arg(long, help = "Clear the screen before starting", long_help)]
+    pub clear: bool,
 
     /// Enable logging of internal events to a file at the specified path. Useful for debugging I/O issues (connection errors, disconnections, file write errors, etc.).
     #[arg(long, value_name = "PATH", help = "Log file path", long_help)]

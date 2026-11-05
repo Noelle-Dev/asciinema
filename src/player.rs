@@ -4,7 +4,8 @@ use tokio::time::{self, Duration, Instant};
 
 use crate::asciicast::{self, CursorShape, Event, EventData};
 use crate::config::Key;
-use crate::tty::{DevTty, RawTty};
+use crate::tty::{DevTty, RawTty, TtyTheme};
+use rgb::RGB8;
 
 pub struct KeyBindings {
     pub quit: Key,
@@ -24,6 +25,7 @@ impl Default for KeyBindings {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn play(
     recording: asciicast::Asciicast<'static>,
     speed: f64,
@@ -31,13 +33,19 @@ pub async fn play(
     pause_on_markers: bool,
     keys: &KeyBindings,
     auto_resize: bool,
+    apply_theme: bool,
+    clear: bool,
 ) -> Result<bool> {
     let mut tty = DevTty::open().await?;
-    let cursor = recording.header.term_cursor;
+    let header = &recording.header;
 
-    if let Some(shape) = cursor {
-        tty.write_all(shape.escape_sequence().as_bytes()).await?;
-    }
+    let settings = TerminalSettings {
+        cursor: header.term_cursor,
+        theme: header.term_theme.clone().filter(|_| apply_theme),
+        clear,
+    };
+
+    let restore = apply_terminal_settings(&tty, settings).await?;
 
     let result = play_on(
         &mut tty,
@@ -50,12 +58,74 @@ pub async fn play(
     )
     .await;
 
-    // Restore the cursor however playback ended: finished, quit or error.
-    if cursor.is_some() {
-        let _ = tty.write_all(CursorShape::RESET_SEQUENCE.as_bytes()).await;
-    }
+    // Restore however playback ended: finished, quit or error.
+    let _ = tty.write_all(restore.as_bytes()).await;
 
     result
+}
+
+struct TerminalSettings {
+    cursor: Option<CursorShape>,
+    theme: Option<TtyTheme>,
+    /// Clear the screen before playing (the result stays on screen afterwards).
+    clear: bool,
+}
+
+/// Switches the terminal to the recording's cursor shape and colors.
+/// Returns the escape sequences that undo it.
+async fn apply_terminal_settings(tty: &DevTty, settings: TerminalSettings) -> Result<String> {
+    let TerminalSettings {
+        cursor,
+        theme,
+        clear,
+    } = settings;
+
+    let mut apply = String::new();
+    let mut restore = String::new();
+
+    if clear {
+        apply.push_str(crate::tty::CLEAR_SCREEN);
+    }
+
+    if let Some(shape) = cursor {
+        apply.push_str(shape.escape_sequence());
+        restore.push_str(CursorShape::RESET_SEQUENCE);
+    }
+
+    if let Some(theme) = theme {
+        // Ask for the current colors first so exactly those can be put back.
+        // Terminals that don't answer get a reset to their configured colors.
+        let (_, current) = crate::tty::inspect(tty).await;
+
+        apply.push_str(&theme_sequence(&theme));
+        restore.push_str(&match current {
+            Some(current) => theme_sequence(&current),
+            None => THEME_RESET_SEQUENCE.to_owned(),
+        });
+    }
+
+    tty.write_all(apply.as_bytes()).await?;
+
+    Ok(restore)
+}
+
+/// Resets palette (OSC 104), foreground (OSC 110) and background (OSC 111).
+const THEME_RESET_SEQUENCE: &str = "\x1b]104\x07\x1b]110\x07\x1b]111\x07";
+
+/// Sets foreground (OSC 10), background (OSC 11) and palette (OSC 4).
+fn theme_sequence(theme: &TtyTheme) -> String {
+    let color = |c: RGB8| format!("rgb:{:02x}/{:02x}/{:02x}", c.r, c.g, c.b);
+    let mut seq = format!(
+        "\x1b]10;{}\x07\x1b]11;{}\x07",
+        color(theme.fg),
+        color(theme.bg)
+    );
+
+    for (i, &c) in theme.palette.iter().enumerate().take(16) {
+        seq.push_str(&format!("\x1b]4;{i};{}\x07", color(c)));
+    }
+
+    seq
 }
 
 async fn play_on(
@@ -205,4 +275,28 @@ fn emit_session_events(
     });
 
     Ok(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use rgb::RGB8;
+
+    use super::theme_sequence;
+    use crate::tty::TtyTheme;
+
+    #[test]
+    fn theme_sequence_sets_fg_bg_and_palette() {
+        let theme = TtyTheme {
+            fg: RGB8::new(0xcc, 0xcc, 0xcc),
+            bg: RGB8::new(0x0c, 0x0c, 0x0c),
+            palette: (0..16).map(|i| RGB8::new(i, 0, 0xff)).collect(),
+        };
+
+        let seq = theme_sequence(&theme);
+
+        assert!(seq.starts_with("\x1b]10;rgb:cc/cc/cc\x07\x1b]11;rgb:0c/0c/0c\x07"));
+        assert!(seq.contains("\x1b]4;0;rgb:00/00/ff\x07"));
+        assert!(seq.ends_with("\x1b]4;15;rgb:0f/00/ff\x07"));
+        assert_eq!(seq.matches("\x1b]4;").count(), 16);
+    }
 }

@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::asciicast::CursorShape;
+use crate::asciicast::{CursorShape, Header};
+use crate::tty::TtyTheme;
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -31,6 +32,98 @@ pub enum Edit {
     /// Set the cursor shape stored in the recording's header (`None` removes
     /// it, so playback uses the terminal's default).
     SetCursor { shape: Option<CursorShape> },
+
+    /// Set (or with `None`, remove) the recording's title.
+    SetTitle { title: Option<String> },
+
+    /// Set (or remove) the recorded command shown in the metadata.
+    SetCommand { command: Option<String> },
+
+    /// Set (or remove) the idle time limit players apply on playback.
+    SetIdleTimeLimit { secs: Option<f64> },
+
+    /// Replace (or remove) the terminal color theme.
+    SetTheme { theme: Option<ThemeColors> },
+}
+
+/// A color theme as stored in the edit list, with `#rrggbb` colors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThemeColors {
+    pub fg: String,
+    pub bg: String,
+    pub palette: Vec<String>,
+}
+
+impl ThemeColors {
+    pub fn from_tty(theme: &TtyTheme) -> Self {
+        Self {
+            fg: to_hex(theme.fg),
+            bg: to_hex(theme.bg),
+            palette: theme.palette.iter().map(|&c| to_hex(c)).collect(),
+        }
+    }
+
+    pub fn to_tty(&self) -> Result<TtyTheme> {
+        let color = |s: &str| parse_hex(s).with_context(|| format!("invalid color '{s}'"));
+
+        if self.palette.len() != 16 {
+            bail!(
+                "a theme palette needs 16 colors, got {}",
+                self.palette.len()
+            );
+        }
+
+        Ok(TtyTheme {
+            fg: color(&self.fg)?,
+            bg: color(&self.bg)?,
+            palette: self
+                .palette
+                .iter()
+                .map(|c| color(c))
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// Parses `#rrggbb`.
+pub fn parse_hex(s: &str) -> Option<rgb::RGB8> {
+    let hex = s.strip_prefix('#')?;
+
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+
+    Some(rgb::RGB8::new(byte(0)?, byte(2)?, byte(4)?))
+}
+
+pub fn to_hex(c: rgb::RGB8) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+}
+
+/// Applies the header edits in `edits` (the last of each kind wins) to `original`.
+pub fn apply_header(original: &Header, edits: &[Edit]) -> Header {
+    let mut header = original.clone();
+
+    for edit in edits {
+        match edit {
+            Edit::SetCursor { shape } => header.term_cursor = *shape,
+            Edit::SetTitle { title } => header.title = title.clone(),
+            Edit::SetCommand { command } => header.command = command.clone(),
+            Edit::SetIdleTimeLimit { secs } => header.idle_time_limit = *secs,
+
+            Edit::SetTheme { theme } => {
+                // validated on push, so a bad theme can only come from a
+                // hand-edited file; ignore it rather than failing
+                header.term_theme = theme.as_ref().and_then(|t| t.to_tty().ok());
+            }
+
+            Edit::SetDelay { .. } | Edit::Scale { .. } | Edit::CapIdle { .. } => {}
+        }
+    }
+
+    header
 }
 
 /// An ordered list of edits for one recording. Edits are applied in order.
@@ -123,9 +216,13 @@ impl EditList {
                 .edits
                 .retain(|e| !matches!(*e, Edit::SetDelay { event: other, .. } if other == event)),
 
-            Edit::SetCursor { .. } => self.edits.retain(|e| !matches!(e, Edit::SetCursor { .. })),
+            Edit::Scale { .. } | Edit::CapIdle { .. } => {}
 
-            _ => {}
+            // header edits: one of each kind
+            _ => {
+                let kind = std::mem::discriminant(&edit);
+                self.edits.retain(|e| std::mem::discriminant(e) != kind);
+            }
         }
 
         let replaced = self.edits.len() != len;
@@ -192,7 +289,22 @@ impl Edit {
                 check_secs("idle cap", max)
             }
 
-            Edit::SetCursor { .. } => Ok(()),
+            Edit::SetCursor { .. } | Edit::SetTitle { .. } | Edit::SetCommand { .. } => Ok(()),
+
+            Edit::SetIdleTimeLimit { secs } => match secs {
+                Some(v) if !v.is_finite() || v <= 0.0 => {
+                    bail!("idle time limit must be a positive number of seconds, got {v}")
+                }
+                _ => Ok(()),
+            },
+
+            Edit::SetTheme { ref theme } => {
+                if let Some(t) = theme {
+                    t.to_tty()?;
+                }
+
+                Ok(())
+            }
         }
     }
 }
@@ -410,6 +522,82 @@ mod tests {
                 shape: Some(CursorShape::BlinkingBar)
             }
         );
+    }
+
+    #[test]
+    fn header_edits() {
+        use crate::asciicast::Header;
+
+        use super::{apply_header, ThemeColors};
+
+        let original = Header {
+            title: Some("old".to_owned()),
+            idle_time_limit: Some(2.0),
+            ..Default::default()
+        };
+
+        let theme = ThemeColors {
+            fg: "#ffffff".to_owned(),
+            bg: "#000000".to_owned(),
+            palette: vec!["#112233".to_owned(); 16],
+        };
+
+        let mut list = EditList::new(3);
+        list.push(Edit::SetTitle {
+            title: Some("first".to_owned()),
+        })
+        .unwrap();
+        list.push(Edit::SetDelay {
+            event: 1,
+            secs: 1.0,
+        })
+        .unwrap();
+        list.push(Edit::SetTitle {
+            title: Some("second".to_owned()),
+        })
+        .unwrap();
+        list.push(Edit::SetIdleTimeLimit { secs: None }).unwrap();
+        list.push(Edit::SetTheme { theme: Some(theme) }).unwrap();
+
+        // one entry per header field
+        assert_eq!(list.edits.len(), 4);
+
+        let h = apply_header(&original, &list.edits);
+        assert_eq!(h.title.as_deref(), Some("second"));
+        assert_eq!(h.idle_time_limit, None);
+        assert_eq!(
+            h.term_theme.unwrap().palette[3],
+            rgb::RGB8::new(0x11, 0x22, 0x33)
+        );
+
+        assert!(list
+            .push(Edit::SetIdleTimeLimit { secs: Some(0.0) })
+            .is_err());
+
+        let bad = ThemeColors {
+            fg: "red".to_owned(),
+            bg: "#000000".to_owned(),
+            palette: vec!["#000000".to_owned(); 16],
+        };
+        assert!(list.push(Edit::SetTheme { theme: Some(bad) }).is_err());
+
+        let short = ThemeColors {
+            fg: "#000000".to_owned(),
+            bg: "#000000".to_owned(),
+            palette: vec!["#000000".to_owned(); 8],
+        };
+        assert!(list.push(Edit::SetTheme { theme: Some(short) }).is_err());
+    }
+
+    #[test]
+    fn hex_colors() {
+        use super::{parse_hex, to_hex};
+
+        assert_eq!(parse_hex("#0c0C0c"), Some(rgb::RGB8::new(12, 12, 12)));
+        assert_eq!(parse_hex("0c0c0c"), None);
+        assert_eq!(parse_hex("#0c0c0"), None);
+        assert_eq!(parse_hex("#0c0c0g"), None);
+        assert_eq!(to_hex(rgb::RGB8::new(255, 0, 16)), "#ff0010");
     }
 
     #[test]

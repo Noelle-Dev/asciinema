@@ -1,6 +1,8 @@
 //! Interactive terminal editor (`asciinema edit <file>`).
 
 mod app;
+mod color;
+mod meta;
 mod ui;
 
 use std::io;
@@ -108,6 +110,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.meta.is_some() {
+        meta::handle_key(app, key);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => app.quit = true,
 
@@ -147,7 +154,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         // view
         KeyCode::Char('t') => app.toggle_mode(),
-        KeyCode::Char('C') => app.cycle_cursor(),
+        KeyCode::Char('C') => meta::open_cursor_picker(app),
+        KeyCode::Char('m') => meta::open(app),
         KeyCode::Char('(') => app.zoom_by(2.0),
         KeyCode::Char(')') => app.zoom_by(0.5),
         KeyCode::Char('f') => app.fullscreen = !app.fullscreen,
@@ -180,6 +188,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, areas: Areas) {
     }
 
     let (mx, my) = (mouse.column, mouse.row);
+
+    if app.meta.is_some() && contains(areas.meta, mx, my) {
+        meta::handle_mouse(app, mouse, areas.meta);
+        return;
+    }
     let tl = areas.timeline;
     let in_timeline = contains(tl, mx, my);
     let x = mx.saturating_sub(tl.x).min(tl.width.saturating_sub(1));

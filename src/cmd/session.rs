@@ -129,6 +129,12 @@ impl cli::Session {
         let exit_status = {
             let mut raw_tty = tty.open_raw().await?;
 
+            if self.clear {
+                raw_tty
+                    .write_all(crate::tty::CLEAR_SCREEN.as_bytes())
+                    .await?;
+            }
+
             session::run(
                 command,
                 extra_env,

@@ -14,8 +14,8 @@ use std::time::Duration;
 use anyhow::Result;
 use avt::Vt;
 
-use super::{retime, Edit, EditList};
-use crate::asciicast::{Asciicast, CursorShape, Event, EventData, Header};
+use super::{retime, EditList};
+use crate::asciicast::{Asciicast, Event, EventData, Header, Version};
 
 /// Take a keyframe after at least this many bytes of output since the last one...
 const KEYFRAME_BYTES: usize = 16 * 1024;
@@ -25,9 +25,12 @@ const KEYFRAME_EVENTS: usize = 1000;
 
 pub struct Timeline {
     pub header: Header,
+    /// Format version of the file this was loaded from, if loaded from one.
+    pub source_version: Option<Version>,
     events: Vec<Event>,
     original_times: Vec<Duration>,
-    original_cursor: Option<CursorShape>,
+    /// Header as recorded, before metadata edits.
+    original_header: Header,
     times: Vec<Duration>,
     keyframes: Vec<Keyframe>,
 }
@@ -43,8 +46,10 @@ struct Keyframe {
 impl Timeline {
     pub fn load(cast: Asciicast<'_>) -> Result<Self> {
         let events = cast.events.collect::<Result<Vec<_>>>()?;
+        let mut timeline = Self::new(cast.header, events);
+        timeline.source_version = Some(cast.version);
 
-        Ok(Self::new(cast.header, events))
+        Ok(timeline)
     }
 
     pub fn new(header: Header, events: Vec<Event>) -> Self {
@@ -52,7 +57,8 @@ impl Timeline {
         let keyframes = build_keyframes(&header, &events);
 
         Self {
-            original_cursor: header.term_cursor,
+            original_header: header.clone(),
+            source_version: None,
             header,
             times: original_times.clone(),
             original_times,
@@ -104,15 +110,12 @@ impl Timeline {
     pub fn apply_edits(&mut self, edits: &EditList) {
         self.times = retime::apply(&self.original_times, &edits.edits);
 
-        self.header.term_cursor = edits
-            .edits
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                Edit::SetCursor { shape } => Some(*shape),
-                _ => None,
-            })
-            .unwrap_or(self.original_cursor);
+        self.header = super::edits::apply_header(&self.original_header, &edits.edits);
+    }
+
+    /// Header as recorded, before metadata edits.
+    pub fn original_header(&self) -> &Header {
+        &self.original_header
     }
 
     /// Number of events that have happened by time `t` (i.e. the index of the

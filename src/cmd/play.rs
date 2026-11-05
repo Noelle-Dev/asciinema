@@ -30,6 +30,8 @@ impl cli::Play {
                 self.pause_on_markers,
                 &keys,
                 self.resize,
+                !self.ignore_theme,
+                self.clear,
             ))?;
 
             if !self.loop_ || !ended {

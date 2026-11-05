@@ -21,6 +21,9 @@ pub use default::DevTty;
 #[cfg(any(target_os = "macos", feature = "macos-tty"))]
 pub use macos::DevTty;
 
+/// Moves the cursor home and erases the screen.
+pub const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TtySize(pub u16, pub u16);
 
