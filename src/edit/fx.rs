@@ -686,7 +686,7 @@ fn cell_diff(
 }
 
 /// An SGR sequence fully setting `pen` (starting from a reset).
-fn sgr(pen: &avt::Pen) -> String {
+pub(crate) fn sgr(pen: &avt::Pen) -> String {
     let mut s = String::from("\x1b[0");
 
     for (on, code) in [

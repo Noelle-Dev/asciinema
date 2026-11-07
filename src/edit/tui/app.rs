@@ -126,6 +126,8 @@ pub struct App {
     pub meta: Option<super::meta::Panel>,
     /// Effect side panel, when open.
     pub fx: Option<super::fxpanel::FxPanel>,
+    /// Text editor, when open.
+    pub text: Option<super::textedit::TextEditor>,
     pub prompt: Option<Prompt>,
     pub drag: Option<Drag>,
     message: Option<(String, bool, Instant)>,
@@ -162,6 +164,7 @@ impl App {
             selection_anchor: None,
             meta: None,
             fx: None,
+            text: None,
             prompt: None,
             drag: None,
             message: None,
@@ -419,7 +422,14 @@ impl App {
     /// Original event whose (editable) preceding pause the playhead is in.
     /// `None` at the end, or inside an inserted clip.
     pub fn target_event(&self) -> Option<usize> {
-        self.timeline.delay_owner(self.position)
+        // text edits are drawn in no time: the pause is the next item's
+        let mut i = self.position;
+
+        while let Some(Origin::TextEdit { .. }) = self.timeline.origin(i) {
+            i += 1;
+        }
+
+        self.timeline.delay_owner(i)
     }
 
     fn no_pause_here(&mut self) {
@@ -590,6 +600,7 @@ impl App {
             Some(Origin::Event(e)) => e,
             Some(Origin::Cut { to, .. }) => to + 1,
             Some(Origin::Clip { insert }) => self.insert_edit(insert).map_or(0, |(_, at)| at),
+            Some(Origin::TextEdit { edit }) => self.text_edit(edit).map_or(0, |(_, at)| at),
             None => self.timeline.original_len(),
         }
     }
@@ -608,6 +619,19 @@ impl App {
             .nth(k)
     }
 
+    /// The `k`-th text edit: (index in the edit list, position).
+    fn text_edit(&self, k: usize) -> Option<(usize, usize)> {
+        self.edits
+            .edits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Edit::Text { at, .. } => Some((i, *at)),
+                _ => None,
+            })
+            .nth(k)
+    }
+
     /// Cuts the selected frames, or the frame on screen (the events behind
     /// them, and any inserted clips among them).
     pub fn delete(&mut self) {
@@ -618,6 +642,7 @@ impl App {
 
         let mut events: Option<(usize, usize)> = None;
         let mut clips = Vec::new();
+        let mut texts = Vec::new();
 
         for i in lo..=hi {
             match self.timeline.origin(i) {
@@ -626,11 +651,18 @@ impl App {
                 }
 
                 Some(Origin::Clip { insert }) if !clips.contains(&insert) => clips.push(insert),
+                Some(Origin::TextEdit { edit }) if !texts.contains(&edit) => texts.push(edit),
                 _ => {}
             }
         }
 
-        if events.is_none() && clips.is_empty() {
+        // text edits are removed when they're what's selected, not when
+        // their drawing happens to fall inside a range of events being cut
+        if events.is_some() {
+            texts.clear();
+        }
+
+        if events.is_none() && clips.is_empty() && texts.is_empty() {
             self.info("Already cut - D restores it");
             return;
         }
@@ -638,12 +670,21 @@ impl App {
         let remove: Vec<usize> = clips
             .iter()
             .filter_map(|&k| self.insert_edit(k).map(|(i, _)| i))
+            .chain(
+                texts
+                    .iter()
+                    .filter_map(|&k| self.text_edit(k).map(|(i, _)| i)),
+            )
             .collect();
 
-        let msg = match (events, clips.len()) {
-            (Some((a, b)), 0) => format!("Cut events {a}..{b} (saved; D restores)"),
-            (Some((a, b)), n) => format!("Cut events {a}..{b} and {n} inserted clip(s) (saved)"),
-            (None, n) => format!("Removed {n} inserted clip(s) (saved)"),
+        let msg = match (events, clips.len(), texts.len()) {
+            (Some((a, b)), 0, _) => format!("Cut events {a}..{b} (saved; D restores)"),
+            (Some((a, b)), n, _) => {
+                format!("Cut events {a}..{b} and {n} inserted clip(s) (saved)")
+            }
+            (None, 0, n) => format!("Removed {n} text edit(s) (saved)"),
+            (None, n, 0) => format!("Removed {n} inserted clip(s) (saved)"),
+            (None, n, m) => format!("Removed {n} inserted clip(s) and {m} text edit(s) (saved)"),
         };
 
         self.selection_anchor = None;

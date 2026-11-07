@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use avt::Vt;
 
-use super::edits::Clip;
+use super::edits::{Clip, Occurrences, TextMode};
 use super::{retime, Edit, EditList};
 use crate::asciicast::{self, Asciicast, Event, EventData, Header, Version};
 
@@ -52,6 +52,8 @@ pub enum Origin {
     Cut { from: usize, to: usize },
     /// Part of the `insert`-th inserted clip (counting insert edits in order).
     Clip { insert: usize },
+    /// Drawing of the `edit`-th text edit (counting text edits in order).
+    TextEdit { edit: usize },
 }
 
 enum ItemData {
@@ -69,6 +71,30 @@ struct Item {
     data: ItemData,
     delay: Delay,
     origin: Origin,
+}
+
+/// The original recording with text edits drawn into it: original events,
+/// plus the patches drawing each edit. Cuts and clips work on top of this,
+/// so their redraws show the edits that are active at that point.
+struct Base {
+    items: Vec<ItemData>,
+    /// Index in `items` of original position `p` (before event `p`, after
+    /// the patches at `p`), for `p` in `0..=n`.
+    pos: Vec<usize>,
+    keyframes: Keyframes,
+    /// Patches drawn at original position `p` (before event `p`): (edit, output).
+    pre: Vec<Vec<(usize, String)>>,
+    /// Patches drawn right after event `p`.
+    post: Vec<Vec<(usize, String)>>,
+}
+
+impl Base {
+    fn data<'a>(&'a self, events: &'a [Event], i: usize) -> &'a EventData {
+        match &self.items[i] {
+            ItemData::Original(e) => &events[*e].data,
+            ItemData::Owned(d) => d,
+        }
+    }
 }
 
 /// Another recording used as a clip source.
@@ -99,6 +125,9 @@ pub struct Timeline {
     event_pos: Vec<Option<usize>>,
     /// The structural edits the playlist was built from.
     structure: Vec<Edit>,
+
+    /// The recording with its text edits, when there are any.
+    base: Option<Base>,
 
     /// Directory that relative clip paths are resolved against.
     clip_base: PathBuf,
@@ -141,6 +170,7 @@ impl Timeline {
             events,
             items,
             structure: Vec::new(),
+            base: None,
             clip_base: PathBuf::from("."),
             sources: Mutex::new(HashMap::new()),
         }
@@ -241,14 +271,18 @@ impl Timeline {
             .filter(|e| {
                 matches!(
                     e,
-                    Edit::Delete { .. } | Edit::Insert { .. } | Edit::Replace { .. }
+                    Edit::Delete { .. }
+                        | Edit::Insert { .. }
+                        | Edit::Replace { .. }
+                        | Edit::Text { .. }
                 )
             })
             .cloned()
             .collect();
 
         if structure != self.structure {
-            let items = self.compile(&structure)?;
+            let base = self.build_base(&structure);
+            let items = self.compile(&structure, base.as_ref())?;
             let size = (
                 self.original_header.term_cols as usize,
                 self.original_header.term_rows as usize,
@@ -266,6 +300,7 @@ impl Timeline {
             }
 
             self.items = items;
+            self.base = base;
             self.structure = structure;
             self.structure_version += 1;
         }
@@ -321,10 +356,15 @@ impl Timeline {
         }
     }
 
-    /// Screen of the original recording after `p` events.
+    /// Screen of the recording after `p` events, with the text edits active
+    /// there (but no cuts or clips).
     pub fn original_vt_at(&self, p: usize) -> Vt {
-        self.original_keyframes
-            .vt_at(p.min(self.events.len()), |i| &self.events[i].data)
+        base_vt(
+            &self.events,
+            &self.original_keyframes,
+            self.base.as_ref(),
+            p,
+        )
     }
 
     /// Playlist events with their edited times.
@@ -337,7 +377,8 @@ impl Timeline {
 
     // ---- building the playlist ----------------------------------------------
 
-    fn compile(&self, structure: &[Edit]) -> Result<Vec<Item>> {
+    fn compile(&self, structure: &[Edit], base: Option<&Base>) -> Result<Vec<Item>> {
+        let screen_at = |p: usize| base_vt(&self.events, &self.original_keyframes, base, p);
         let n = self.events.len();
         let mut deleted = vec![false; n];
         let mut replaced = vec![false; n];
@@ -385,11 +426,38 @@ impl Timeline {
         let mut showing = 0;
         let mut cut_from = None;
 
+        // text edit patches; not inside cuts or replaced events, whose
+        // closing redraw shows the edited screen anyway
+        let patch = |b: &mut Builder, patches: &[(usize, String)]| {
+            for (edit, out) in patches {
+                b.push(
+                    output(out.clone()),
+                    Delay::Fixed(Duration::ZERO),
+                    Origin::TextEdit { edit: *edit },
+                );
+            }
+        };
+
         for p in 0..=n {
+            let skipped = p < n && (deleted[p] || replaced[p]);
+
+            if let Some(base) = base {
+                if !skipped && cut_from.is_none() {
+                    patch(&mut b, &base.pre[p]);
+                }
+            }
+
             for &(insert, clip, replaces) in &inserts[p] {
                 // a replace ends on the screen as it was after the replaced events
                 let restore_to = replaces.map_or(showing, |to| to + 1);
-                self.push_clip(&mut b, Origin::Clip { insert }, clip, showing, restore_to)?;
+                self.push_clip(
+                    &mut b,
+                    Origin::Clip { insert },
+                    clip,
+                    showing,
+                    restore_to,
+                    &screen_at,
+                )?;
                 showing = restore_to;
             }
 
@@ -410,11 +478,7 @@ impl Timeline {
             if let Some(from) = cut_from.take() {
                 // jump cut: show the screen as it was after the cut, then go on
                 let origin = Origin::Cut { from, to: p - 1 };
-                b.redraw(
-                    self.original_keyframes.vt_at(p, |i| &self.events[i].data),
-                    Delay::Of(p),
-                    origin,
-                );
+                b.redraw(screen_at(p), Delay::Of(p), origin);
                 b.push(
                     ItemData::Original(p),
                     Delay::Fixed(Duration::ZERO),
@@ -426,6 +490,10 @@ impl Timeline {
 
             if let EventData::Resize(cols, rows) = self.events[p].data {
                 b.size = (cols as usize, rows as usize);
+            }
+
+            if let Some(base) = base {
+                patch(&mut b, &base.post[p]);
             }
 
             showing = p + 1;
@@ -450,6 +518,7 @@ impl Timeline {
         clip: &Clip,
         showing: usize,
         restore_to: usize,
+        screen_at: &dyn Fn(usize) -> Vt,
     ) -> Result<()> {
         let empty = || ItemData::Owned(EventData::Output(String::new()));
         let secs = |s: f64| Duration::from_secs_f64(s);
@@ -495,9 +564,7 @@ impl Timeline {
                     }
                 }
 
-                let before = self
-                    .original_keyframes
-                    .vt_at(restore_to, |i| &self.events[i].data);
+                let before = screen_at(restore_to);
                 b.redraw(before, Delay::Fixed(secs(*hold)), origin);
 
                 return Ok(());
@@ -561,9 +628,7 @@ impl Timeline {
                     None => pending + CLIP_TAIL,
                 };
 
-                let before = self
-                    .original_keyframes
-                    .vt_at(restore_to, |i| &self.events[i].data);
+                let before = screen_at(restore_to);
                 b.redraw(before, Delay::Fixed(tail), origin);
 
                 return Ok(());
@@ -572,12 +637,159 @@ impl Timeline {
 
         // put back the screen as it was before the clip (or, replacing, after
         // the replaced events)
-        let before = self
-            .original_keyframes
-            .vt_at(restore_to, |i| &self.events[i].data);
+        let before = screen_at(restore_to);
         b.redraw(before, fixed0(), origin);
 
         Ok(())
+    }
+
+    /// Builds the recording with its text edits drawn in (see [`Base`]),
+    /// or `None` when there are none.
+    fn build_base(&self, structure: &[Edit]) -> Option<Base> {
+        let edits: Vec<TextEdit> = structure
+            .iter()
+            .filter_map(|e| match e {
+                Edit::Text {
+                    at,
+                    row,
+                    col,
+                    from,
+                    to,
+                    mode,
+                    styles,
+                } => Some(TextEdit {
+                    at: *at,
+                    row: *row,
+                    col: *col,
+                    from: from.chars().collect(),
+                    to: to.clone(),
+                    mode: *mode,
+                    styles: super::style::from_runs(styles),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        if edits.is_empty() {
+            return None;
+        }
+
+        let n = self.events.len();
+        let size = (
+            self.original_header.term_cols as usize,
+            self.original_header.term_rows as usize,
+        );
+
+        let mut vt = new_vt(size.0, size.1);
+        // the recording without its edits: "everywhere" edits are worked out
+        // from this, so text the recording adds to a changed line (typing
+        // after a shortened prompt, say) moves along with the change
+        let mut plain = new_vt(size.0, size.1);
+        let mut items = Vec::with_capacity(n + edits.len());
+        let mut pos = Vec::with_capacity(n + 1);
+        let mut pre = vec![Vec::new(); n + 1];
+        let mut post = vec![Vec::new(); n];
+
+        let draw = |vt: &mut Vt,
+                    items: &mut Vec<ItemData>,
+                    out: &mut Vec<(usize, String)>,
+                    k: usize,
+                    s: String| {
+            vt.feed_str(&s);
+            items.push(output(s.clone()));
+            out.push((k, s));
+        };
+
+        for p in 0..=n {
+            // edits starting here
+            for (k, e) in edits.iter().enumerate().filter(|(_, e)| e.at == p) {
+                match e.mode {
+                    TextMode::UntilDrawnOver => {
+                        let mut s = shifted_patch(&vt, e);
+
+                        // a cursor after the change on its line moves along with
+                        // the text, so what's typed next lands in the right place
+                        let c = vt.cursor();
+                        let (from, to) = (e.from.len(), e.to.chars().count());
+
+                        if c.row == e.row && c.col >= e.col + from && from != to {
+                            let col = (c.col + to).saturating_sub(from).min(vt.size().0 - 1);
+                            s.push_str(&format!("\x1b[{};{}H", c.row + 1, col + 1));
+                        }
+
+                        draw(&mut vt, &mut items, &mut pre[p], k, s);
+                    }
+
+                    TextMode::Everywhere { .. } => {
+                        let all: Vec<usize> = (0..vt.size().1).collect();
+                        let active = active_everywhere(&edits, p, n);
+
+                        for (_, s) in everywhere_patches(&plain, &vt, &active, &all) {
+                            draw(&mut vt, &mut items, &mut pre[p], k, s);
+                        }
+
+                        if let Some(s) = everywhere_cursor(&plain, &vt, &active) {
+                            draw(&mut vt, &mut items, &mut pre[p], k, s);
+                        }
+                    }
+                }
+            }
+
+            pos.push(items.len());
+
+            if p == n {
+                break;
+            }
+
+            items.push(ItemData::Original(p));
+
+            let changed = match &self.events[p].data {
+                EventData::Output(s) => {
+                    plain.feed_str(s);
+                    vt.feed_str(s).lines
+                }
+                EventData::Resize(c, r) => {
+                    plain.resize(*c as usize, *r as usize);
+                    vt.resize(*c as usize, *r as usize);
+                    (0..*r as usize).collect()
+                }
+                _ => Vec::new(),
+            };
+
+            // "everywhere" edits: wherever the text shows up in what changed
+            let active = active_everywhere(&edits, p + 1, n);
+
+            if changed.is_empty() && active.is_empty() {
+                continue;
+            }
+
+            for (k, s) in everywhere_patches(&plain, &vt, &active, &changed) {
+                draw(&mut vt, &mut items, &mut post[p], k, s);
+            }
+
+            if let Some((k, _)) = active.first() {
+                if let Some(s) = everywhere_cursor(&plain, &vt, &active) {
+                    draw(&mut vt, &mut items, &mut post[p], *k, s);
+                }
+            }
+        }
+
+        let events = &self.events;
+        let keyframes = Keyframes::build(
+            size,
+            items.iter().map(|d| match d {
+                ItemData::Original(e) => &events[*e].data,
+                ItemData::Owned(d) => d,
+            }),
+        );
+
+        Some(Base {
+            items,
+            pos,
+            keyframes,
+            pre,
+            post,
+        })
     }
 
     fn source(&self, path: &str) -> Result<Arc<Source>> {
@@ -605,6 +817,353 @@ impl Timeline {
 
         Ok(source)
     }
+}
+
+/// Screen after `p` original events: of the recording with its text edits
+/// (`base`) if there are any, else of the original.
+fn base_vt(events: &[Event], original: &Keyframes, base: Option<&Base>, p: usize) -> Vt {
+    match base {
+        Some(b) => {
+            let i = b.pos[p.min(b.pos.len() - 1)];
+            b.keyframes.vt_at(i, |j| b.data(events, j))
+        }
+
+        None => original.vt_at(p.min(events.len()), |i| &events[i].data),
+    }
+}
+
+/// A text edit, ready for matching.
+struct TextEdit {
+    at: usize,
+    row: usize,
+    col: usize,
+    from: Vec<char>,
+    to: String,
+    mode: TextMode,
+    /// Per-character styles for `to` (empty: the cells' own).
+    styles: Vec<super::style::TextStyle>,
+}
+
+/// Drawing instructions changing `width` cells at `row`, `col` to `to`
+/// (padded with spaces; a longer `to` overwrites the cells after). Each
+/// character is drawn in `styles[i]`, or where that's missing, its cell's
+/// existing style. The cursor, pen and modes are left as they were.
+pub fn text_patch(
+    vt: &Vt,
+    row: usize,
+    col: usize,
+    width: usize,
+    to: &str,
+    styles: &[super::style::TextStyle],
+) -> String {
+    let (cols, rows) = vt.size();
+
+    if row >= rows || col >= cols {
+        return String::new();
+    }
+
+    let line = vt.line(row);
+    let cells = line.cells();
+    let to: Vec<char> = to.chars().collect();
+    let n = width.max(to.len()).min(cols - col);
+
+    // save cursor and pen; origin mode off so the position is absolute
+    let mut out = format!("\x1b7\x1b[?6l\x1b[{};{}H", row + 1, col + 1);
+    let mut pen: Option<super::style::TextStyle> = None;
+
+    for i in 0..n {
+        let style = styles.get(i).copied().unwrap_or_else(|| {
+            let cell_pen = cells.get(col + i).map(|c| *c.pen()).unwrap_or_default();
+            super::style::TextStyle::from_pen(&cell_pen)
+        });
+
+        if pen != Some(style) {
+            out.push_str(&style.sgr());
+            pen = Some(style);
+        }
+
+        out.push(to.get(i).copied().unwrap_or(' '));
+    }
+
+    // restores the cursor, pen and origin mode
+    out.push_str("\x1b8");
+
+    out
+}
+
+/// Columns where `from` starts in `line` (non-overlapping).
+fn find_text(line: &avt::Line, from: &[char]) -> Vec<usize> {
+    let cells: Vec<(usize, char)> = line
+        .cells()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.width() > 0)
+        .map(|(i, c)| (i, c.char()))
+        .collect();
+
+    let mut found = Vec::new();
+    let mut i = 0;
+
+    while !from.is_empty() && i + from.len() <= cells.len() {
+        if cells[i..i + from.len()]
+            .iter()
+            .map(|(_, c)| *c)
+            .eq(from.iter().copied())
+        {
+            found.push(cells[i].0);
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+
+    found
+}
+
+/// The "everywhere" edits in effect after `p` events: (index, edit).
+fn active_everywhere(edits: &[TextEdit], p: usize, n: usize) -> Vec<(usize, &TextEdit)> {
+    edits
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| match e.mode {
+            TextMode::Everywhere { until, .. } => e.at <= p && p <= until.unwrap_or(n),
+            TextMode::UntilDrawnOver => false,
+        })
+        .collect()
+}
+
+/// An "until drawn over" edit on the current screen: `e.to` replaces the
+/// `e.from`-wide text at its position and the rest of the line moves along
+/// (keeping its own characters and styles) when the lengths differ.
+fn shifted_patch(vt: &Vt, e: &TextEdit) -> String {
+    use super::style::TextStyle;
+
+    let (cols, rows) = vt.size();
+
+    if e.row >= rows || e.col >= cols {
+        return String::new();
+    }
+
+    let cells: Vec<(char, TextStyle)> = vt
+        .line(e.row)
+        .cells()
+        .iter()
+        .filter(|c| c.width() > 0)
+        .map(|c| (c.char(), TextStyle::from_pen(c.pen())))
+        .collect();
+
+    let mut line = replace_in(&cells, &[e.col], e);
+    line.resize(cols, (' ', TextStyle::default()));
+    line.truncate(cols);
+
+    let (text, styles): (String, Vec<TextStyle>) = line[e.col..].iter().copied().unzip();
+
+    text_patch(vt, e.row, e.col, cols - e.col, &text, &styles)
+}
+
+/// Where "nearest" edits apply: the occurrence closest to where each edit
+/// was made, anywhere on the (unedited) screen.
+fn nearest_targets(plain: &Vt, active: &[(usize, &TextEdit)]) -> Vec<Option<(usize, usize)>> {
+    let rows = plain.size().1;
+
+    active
+        .iter()
+        .map(|(_, e)| match e.mode {
+            TextMode::Everywhere {
+                occurrences: Occurrences::Nearest,
+                ..
+            } => (0..rows)
+                .flat_map(|r| {
+                    find_text(plain.line(r), &e.from)
+                        .into_iter()
+                        .map(move |c| (r, c))
+                })
+                .min_by_key(|&(r, c)| r.abs_diff(e.row) * 1000 + c.abs_diff(e.col)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Row `r` of the unedited screen with every active "everywhere" edit
+/// applied in turn. `None` when none of them is on the line; else the new
+/// cells, the first changed column, the edit that changed it first, and each
+/// pass's (starts, from length, to length) - for mapping columns.
+#[allow(clippy::type_complexity)]
+fn rebuild_line(
+    plain: &Vt,
+    r: usize,
+    active: &[(usize, &TextEdit)],
+    nearest: &[Option<(usize, usize)>],
+) -> Option<(
+    Vec<(char, super::style::TextStyle)>,
+    usize,
+    usize,
+    Vec<(Vec<usize>, usize, usize)>,
+)> {
+    use super::style::TextStyle;
+
+    let mut cells: Vec<(char, TextStyle)> = plain
+        .line(r)
+        .cells()
+        .iter()
+        .filter(|c| c.width() > 0)
+        .map(|c| (c.char(), TextStyle::from_pen(c.pen())))
+        .collect();
+
+    let mut first: Option<(usize, usize)> = None; // (col, edit index)
+    let mut passes = Vec::new();
+
+    for (n, (k, e)) in active.iter().enumerate() {
+        let line: Vec<char> = cells.iter().map(|c| c.0).collect();
+        let mut starts = find_chars(&line, &e.from);
+
+        if let TextMode::Everywhere {
+            occurrences: Occurrences::Nearest,
+            ..
+        } = e.mode
+        {
+            let target = nearest[n].filter(|&(nr, _)| nr == r).map(|(_, c)| c);
+            starts.retain(|&c| Some(c) == target);
+        }
+
+        if starts.is_empty() {
+            continue;
+        }
+
+        let col = starts[0];
+        first = Some(match first {
+            Some((c, k0)) if c <= col => (c, k0),
+            _ => (col, *k),
+        });
+
+        cells = replace_in(&cells, &starts, e);
+        passes.push((starts, e.from.len(), e.to.chars().count()));
+    }
+
+    let (col, k) = first?;
+
+    Some((cells, col, k, passes))
+}
+
+/// Patches for "everywhere" edits on the lines that changed: each line is
+/// rebuilt from the unedited screen `plain`, with every active edit applied
+/// in turn (the rest of the line moving along when lengths differ), and
+/// drawn onto the edited screen `vt`. Returns (edit index, patch) per line.
+fn everywhere_patches(
+    plain: &Vt,
+    vt: &Vt,
+    active: &[(usize, &TextEdit)],
+    changed: &[usize],
+) -> Vec<(usize, String)> {
+    let (cols, rows) = plain.size();
+
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    let nearest = nearest_targets(plain, active);
+    let mut patches = Vec::new();
+
+    for &r in changed.iter().filter(|&&r| r < rows) {
+        let Some((mut cells, col, k, _)) = rebuild_line(plain, r, active, &nearest) else {
+            continue;
+        };
+
+        cells.resize(cols, (' ', super::style::TextStyle::default()));
+        cells.truncate(cols);
+
+        let (text, styles): (String, Vec<_>) = cells[col..].iter().copied().unzip();
+        patches.push((k, text_patch(vt, r, col, cols - col, &text, &styles)));
+    }
+
+    patches
+}
+
+/// Moves the edited screen's cursor to where the unedited screen's cursor
+/// is, adjusted for "everywhere" changes before it on its line - so what the
+/// recording types next lands after the changed text. `None` if it's
+/// already there, or its line has no such change.
+fn everywhere_cursor(plain: &Vt, vt: &Vt, active: &[(usize, &TextEdit)]) -> Option<String> {
+    let c = plain.cursor();
+    let nearest = nearest_targets(plain, active);
+    let (_, _, _, passes) = rebuild_line(plain, c.row, active, &nearest)?;
+
+    let mut col = c.col;
+
+    for (starts, from, to) in passes {
+        let mut shift: isize = 0;
+
+        for s in starts {
+            if s + from <= col {
+                shift += to as isize - from as isize;
+            } else if s <= col {
+                // inside a changed span: keep it within the new text
+                shift += (to.min(col - s) as isize) - (col - s) as isize;
+            }
+        }
+
+        col = col.saturating_add_signed(shift);
+    }
+
+    let col = col.min(vt.size().0 - 1);
+    let now = vt.cursor();
+
+    ((now.row, now.col) != (c.row, col)).then(|| format!("\x1b[{};{}H", c.row + 1, col + 1))
+}
+
+/// Columns where `from` starts in `line` (non-overlapping).
+fn find_chars(line: &[char], from: &[char]) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut i = 0;
+
+    while !from.is_empty() && i + from.len() <= line.len() {
+        if line[i..i + from.len()] == *from {
+            found.push(i);
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+
+    found
+}
+
+/// `cells` with `e.from` at each of `starts` replaced by `e.to`. New text
+/// takes the edit's styles, or those of the cells it replaces; the rest of
+/// the line keeps its own.
+fn replace_in(
+    cells: &[(char, super::style::TextStyle)],
+    starts: &[usize],
+    e: &TextEdit,
+) -> Vec<(char, super::style::TextStyle)> {
+    use super::style::TextStyle;
+
+    let to: Vec<char> = e.to.chars().collect();
+    let mut out = Vec::with_capacity(cells.len());
+    let mut i = 0;
+
+    while i < cells.len() {
+        if starts.contains(&i) {
+            let replaced = &cells[i..(i + e.from.len()).min(cells.len())];
+
+            for (k, ch) in to.iter().enumerate() {
+                let style = e.styles.get(k).copied().unwrap_or_else(|| {
+                    replaced
+                        .get(k.min(replaced.len().saturating_sub(1)))
+                        .map_or_else(TextStyle::default, |c| c.1)
+                });
+
+                out.push((*ch, style));
+            }
+
+            i += e.from.len();
+        } else {
+            out.push(cells[i]);
+            i += 1;
+        }
+    }
+
+    out
 }
 
 fn item_data<'a>(events: &'a [Event], item: &'a Item) -> &'a EventData {
@@ -777,6 +1336,7 @@ mod tests {
 
     use super::{feed, new_vt, Origin, Timeline};
     use crate::asciicast::{self, Event, EventData, Header};
+    use crate::edit::edits::{Occurrences, TextMode};
     use crate::edit::{Clip, Edit, EditList};
 
     fn screen(vt: &Vt) -> (Vec<String>, usize, usize, (usize, usize)) {
@@ -897,76 +1457,128 @@ mod tests {
     fn edits_preserve_the_screen_around_them() {
         let (header, events) = synthetic();
         let n = events.len();
-        let original = Timeline::new(header.clone(), events.clone());
+
+        // text edits change the screen everywhere; cuts and clips mustn't
+        // disturb that, so the reference is the recording with just them
+        let text_edits = vec![
+            Edit::Text {
+                at: 0,
+                row: 0,
+                col: 0,
+                from: "line".to_owned(),
+                to: "LN".to_owned(),
+                mode: TextMode::Everywhere {
+                    until: None,
+                    occurrences: Occurrences::Every,
+                },
+                styles: Vec::new(),
+            },
+            Edit::Text {
+                at: 600,
+                row: 2,
+                col: 0,
+                from: "alt".to_owned(),
+                to: "ALTERED".to_owned(),
+                mode: TextMode::Everywhere {
+                    until: Some(1500),
+                    occurrences: Occurrences::Nearest,
+                },
+                styles: Vec::new(),
+            },
+            Edit::Text {
+                at: 1000,
+                row: 0,
+                col: 0,
+                from: "xxxx".to_owned(),
+                to: "EDIT".to_owned(),
+                mode: TextMode::UntilDrawnOver,
+                styles: Vec::new(),
+            },
+            Edit::Text {
+                at: 15, // inside a cut
+                row: 3,
+                col: 2,
+                from: "ab".to_owned(),
+                to: "AB".to_owned(),
+                mode: TextMode::UntilDrawnOver,
+                styles: Vec::new(),
+            },
+        ];
+
+        let mut original = Timeline::new(header.clone(), events.clone());
+        apply(&mut original, text_edits.clone());
         let mut tl = Timeline::new(header, events);
 
         apply(
             &mut tl,
-            vec![
-                Edit::Delete { from: 10, to: 20 },
-                Edit::Delete {
-                    from: 2490,
-                    to: 2520,
-                }, // spans the resize
-                Edit::Delete { from: 690, to: 720 }, // spans an alt screen switch
-                Edit::Delete {
-                    from: n - 5,
-                    to: n - 1,
-                }, // to the end
-                Edit::Insert {
-                    at: 0,
-                    clip: Clip::Text {
-                        text: "Title\nsub".to_owned(),
-                        secs: 1.0,
+            text_edits
+                .into_iter()
+                .chain(vec![
+                    Edit::Delete { from: 10, to: 20 },
+                    Edit::Delete {
+                        from: 2490,
+                        to: 2520,
+                    }, // spans the resize
+                    Edit::Delete { from: 690, to: 720 }, // spans an alt screen switch
+                    Edit::Delete {
+                        from: n - 5,
+                        to: n - 1,
+                    }, // to the end
+                    Edit::Insert {
+                        at: 0,
+                        clip: Clip::Text {
+                            text: "Title\nsub".to_owned(),
+                            secs: 1.0,
+                        },
                     },
-                },
-                Edit::Insert {
-                    at: 100,
-                    clip: Clip::Blank { secs: 1.0 },
-                },
-                Edit::Insert {
-                    at: 100,
-                    clip: Clip::Hold { secs: 2.0 },
-                },
-                Edit::Insert {
-                    at: 400,
-                    clip: Clip::Recording {
-                        path: None,
-                        from: 3000,
-                        to: Some(3100),
+                    Edit::Insert {
+                        at: 100,
+                        clip: Clip::Blank { secs: 1.0 },
                     },
-                },
-                Edit::Insert {
-                    at: 15,
-                    clip: Clip::Hold { secs: 1.0 },
-                }, // inside a cut
-                Edit::Insert {
-                    at: 2600,
-                    clip: Clip::Recording {
-                        path: None,
-                        from: 5,
-                        to: Some(30),
+                    Edit::Insert {
+                        at: 100,
+                        clip: Clip::Hold { secs: 2.0 },
                     },
-                }, // other size
-                Edit::Insert {
-                    at: n,
-                    clip: Clip::Text {
-                        text: "The end".to_owned(),
-                        secs: 1.0,
+                    Edit::Insert {
+                        at: 400,
+                        clip: Clip::Recording {
+                            path: None,
+                            from: 3000,
+                            to: Some(3100),
+                        },
                     },
-                },
-                Edit::Replace {
-                    from: 800,
-                    to: 900,
-                    clip: Clip::Blank { secs: 1.0 },
-                },
-                // spans an alt screen switch (at event 703)
-                Edit::Replace {
-                    from: 699,
-                    to: 702,
-                    clip: Clip::Hold { secs: 1.0 },
-                },
-            ],
+                    Edit::Insert {
+                        at: 15,
+                        clip: Clip::Hold { secs: 1.0 },
+                    }, // inside a cut
+                    Edit::Insert {
+                        at: 2600,
+                        clip: Clip::Recording {
+                            path: None,
+                            from: 5,
+                            to: Some(30),
+                        },
+                    }, // other size
+                    Edit::Insert {
+                        at: n,
+                        clip: Clip::Text {
+                            text: "The end".to_owned(),
+                            secs: 1.0,
+                        },
+                    },
+                    Edit::Replace {
+                        from: 800,
+                        to: 900,
+                        clip: Clip::Blank { secs: 1.0 },
+                    },
+                    // spans an alt screen switch (at event 703)
+                    Edit::Replace {
+                        from: 699,
+                        to: 702,
+                        clip: Clip::Hold { secs: 1.0 },
+                    },
+                ])
+                .collect(),
         );
 
         let mut linear = new_vt(40, 10);
@@ -977,9 +1589,11 @@ mod tests {
                 continue;
             };
 
+            let reference = original.position_of_event(p).unwrap();
+
             assert_eq!(
                 screen(&tl.vt_at_position(pos)),
-                screen(&original.vt_at_position(p)),
+                screen(&original.vt_at_position(reference)),
                 "screen before original event {p} (playlist {pos}) differs"
             );
 
@@ -999,6 +1613,267 @@ mod tests {
         assert!(tl.position_of_event(15).is_none());
         assert!(tl.position_of_event(2500).is_none());
         assert!(tl.position_of_event(21).is_some());
+    }
+
+    fn text(at: usize, row: usize, col: usize, from: &str, to: &str, mode: TextMode) -> Edit {
+        Edit::Text {
+            at,
+            row,
+            col,
+            from: from.to_owned(),
+            to: to.to_owned(),
+            mode,
+            styles: Vec::new(),
+        }
+    }
+
+    fn everywhere() -> TextMode {
+        TextMode::Everywhere {
+            until: None,
+            occurrences: Occurrences::Every,
+        }
+    }
+
+    /// Screen just before original event `e` (or at the end).
+    fn before(tl: &Timeline, e: usize) -> Vt {
+        tl.vt_at_position(tl.position_of_event(e).unwrap_or(tl.len()))
+    }
+
+    #[test]
+    fn until_drawn_over_persists_scrolls_and_gets_drawn_over() {
+        let mut tl = simple(&[
+            (1, "top\r\nhello world\r\n"),
+            (2, "one\r\n"),
+            (3, "two\r\n"),
+            (4, "three\r\n"), // the screen scrolls by one here
+            (5, "\x1b[1;1Hhelp!"),
+        ]);
+
+        apply(
+            &mut tl,
+            vec![text(1, 1, 0, "hello", "HOWDY", TextMode::UntilDrawnOver)],
+        );
+
+        // drawn at the edit point, as its own item, at the same time
+        let p = tl.position_of_event(1).unwrap();
+        assert_eq!(tl.origin(p - 1), Some(Origin::TextEdit { edit: 0 }));
+        assert_eq!(row(&before(&tl, 1), 1), "HOWDY world");
+
+        // it stays while nothing draws over it ...
+        assert_eq!(row(&before(&tl, 3), 1), "HOWDY world");
+
+        // ... scrolls with the screen ...
+        assert_eq!(row(&before(&tl, 4), 0), "HOWDY world");
+
+        // ... and goes when the recording draws over those cells
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "help! world");
+        assert_eq!(tl.duration(), Duration::from_secs(5), "edits take no time");
+    }
+
+    #[test]
+    fn shifting_styles_and_cursor() {
+        let mut tl = simple(&[(1, "\x1b[31mhello\x1b[0m world"), (2, "!")]);
+        apply(
+            &mut tl,
+            vec![text(1, 0, 0, "hello", "hi", TextMode::UntilDrawnOver)],
+        );
+
+        let vt = tl.vt_at_position(tl.len());
+        // shorter: the rest of the line - and the cursor - move along
+        assert_eq!(row(&vt, 0), "hi world!");
+        assert_eq!(
+            vt.line(0).cells()[1].pen().foreground(),
+            Some(avt::Color::Indexed(1)),
+            "the new text takes the style of what it replaced"
+        );
+        assert_eq!(
+            vt.line(0).cells()[3].pen().foreground(),
+            None,
+            "the rest keeps its own"
+        );
+
+        // longer: pushes the rest along
+        let mut tl = simple(&[(1, "hello world"), (2, "!")]);
+        apply(
+            &mut tl,
+            vec![text(
+                1,
+                0,
+                0,
+                "hello",
+                "greetings",
+                TextMode::UntilDrawnOver,
+            )],
+        );
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "greetings world!");
+    }
+
+    #[test]
+    fn until_drawn_over_moves_the_cursor_with_the_text() {
+        let mut tl = simple(&[(1, "noelle@Home$ "), (2, "e"), (3, "c"), (4, "h"), (5, "o")]);
+        let edit = Edit::Text {
+            at: 1,
+            row: 0,
+            col: 0,
+            from: "noelle@Home".to_owned(),
+            to: "me".to_owned(),
+            mode: TextMode::UntilDrawnOver,
+            styles: Vec::new(),
+        };
+        apply(&mut tl, vec![edit]);
+
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(
+            row(&end, 0),
+            "me$ echo",
+            "what's typed next follows the change"
+        );
+        assert_eq!(end.cursor().col, 8);
+    }
+
+    #[test]
+    fn everywhere_keeps_typing_after_the_change_in_step() {
+        // a prompt, then a command typed after it one key at a time
+        let mut tl = simple(&[(1, "noelle@Home$ "), (2, "e"), (3, "c"), (4, "h"), (5, "o")]);
+        apply(
+            &mut tl,
+            vec![text(0, 0, 0, "noelle@Home", "me", everywhere())],
+        );
+
+        // each typed letter lands right after the shortened prompt, and so
+        // does the cursor
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(row(&end, 0), "me$ echo");
+        assert_eq!(end.cursor().col, 8);
+    }
+
+    #[test]
+    fn everywhere_moves_the_rest_of_each_line() {
+        use crate::asciicast::Event;
+
+        // two occurrences on one line, the second followed by red text
+        let mut tl = Timeline::new(
+            Header {
+                term_cols: 20,
+                term_rows: 2,
+                ..Default::default()
+            },
+            vec![Event::output(
+                Duration::from_secs(1),
+                "cat + cat\x1b[31m!\x1b[0m".to_owned(),
+            )],
+        );
+
+        apply(&mut tl, vec![text(0, 0, 0, "cat", "x", everywhere())]);
+
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(row(&end, 0), "x + x!");
+        assert_eq!(
+            end.line(0).cells()[5].pen().foreground(),
+            Some(avt::Color::Indexed(1))
+        );
+
+        // longer: pushed right
+        apply(&mut tl, vec![text(0, 0, 0, "cat", "kitten", everywhere())]);
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "kitten + kitten!");
+
+        // new text containing the old would keep growing: rejected
+        let mut list = EditList::new(1);
+        assert!(list
+            .push(text(0, 0, 0, "cat", "cats", everywhere()))
+            .is_err());
+    }
+
+    #[test]
+    fn everywhere_survives_repaints_scrolling_and_finds_new_text() {
+        let mut tl = simple(&[
+            (1, "noelle$ ls\r\n"),
+            (2, "\x1b[1;1Hnoelle$ ls"), // a repaint of the same text
+            (3, "\r\nnoelle$ pwd\r\n"), // a new occurrence
+            (4, "a\r\nb\r\nc\r\n"),     // scrolls by one
+        ]);
+
+        apply(&mut tl, vec![text(0, 0, 0, "noelle", "me", everywhere())]);
+
+        // (before(e) is the screen just before event e, counting from 0)
+        assert_eq!(row(&before(&tl, 1), 0), "me$ ls");
+        assert_eq!(row(&before(&tl, 2), 0), "me$ ls", "survives the repaint");
+        assert_eq!(row(&before(&tl, 3), 1), "me$ pwd", "new occurrences too");
+
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(row(&end, 0), "me$ pwd", "and it scrolls");
+        assert!(!end.text().join("").contains("noelle"));
+
+        // with an end: later occurrences are left alone
+        let mut tl = simple(&[(1, "noelle$ ls\r\n"), (2, "noelle$ pwd\r\n")]);
+        apply(
+            &mut tl,
+            vec![text(
+                0,
+                0,
+                0,
+                "noelle",
+                "me",
+                TextMode::Everywhere {
+                    until: Some(1),
+                    occurrences: Occurrences::Every,
+                },
+            )],
+        );
+
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(row(&end, 0), "me$ ls");
+        assert_eq!(row(&end, 1), "noelle$ pwd");
+    }
+
+    #[test]
+    fn every_versus_nearest() {
+        let events = &[(1, "aaa bbb aaa"), (2, "\x1b[1;1Haaa bbb aaa")];
+
+        let mut tl = simple(events);
+        apply(&mut tl, vec![text(1, 0, 8, "aaa", "XXX", everywhere())]);
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "XXX bbb XXX");
+
+        let nearest = TextMode::Everywhere {
+            until: None,
+            occurrences: Occurrences::Nearest,
+        };
+        let mut tl = simple(events);
+        apply(&mut tl, vec![text(1, 0, 8, "aaa", "XXX", nearest)]);
+        assert_eq!(row(&before(&tl, 1), 0), "aaa bbb XXX");
+        assert_eq!(
+            row(&tl.vt_at_position(tl.len()), 0),
+            "aaa bbb XXX",
+            "after the repaint too"
+        );
+    }
+
+    #[test]
+    fn cuts_and_clips_keep_text_edits() {
+        let mut tl = simple(&[(1, "hello world"), (2, "\r\nmore"), (3, "\r\nend")]);
+
+        apply(
+            &mut tl,
+            vec![
+                text(1, 0, 0, "hello", "HOWDY", TextMode::UntilDrawnOver),
+                Edit::Delete { from: 1, to: 1 },
+                Edit::Insert {
+                    at: 3,
+                    clip: Clip::Text {
+                        text: "card".to_owned(),
+                        secs: 1.0,
+                    },
+                },
+            ],
+        );
+
+        // the jump over the cut shows the edited screen ...
+        assert_eq!(row(&before(&tl, 2), 0), "HOWDY world");
+
+        // ... and so does the restore after the card
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(row(&end, 0), "HOWDY world");
+        assert_eq!(row(&end, 1), "more");
     }
 
     #[test]

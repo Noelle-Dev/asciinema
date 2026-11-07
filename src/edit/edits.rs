@@ -56,6 +56,66 @@ pub enum Edit {
     /// Play a clip instead of events `from..=to`. When it ends, the screen is
     /// as it looked after those events.
     Replace { from: usize, to: usize, clip: Clip },
+
+    /// Change text on screen, from position `at` (after `at` events): the
+    /// text `from` at `row`, `col` becomes `to`, in the original cells' style.
+    /// A shorter `to` is padded with spaces; a longer one overwrites the
+    /// cells after `from`.
+    Text {
+        at: usize,
+        row: usize,
+        col: usize,
+        from: String,
+        to: String,
+        #[serde(default, skip_serializing_if = "TextMode::is_default")]
+        mode: TextMode,
+        /// How `to` looks, as runs covering its characters. Empty: each
+        /// character takes the style of the cell it's drawn in.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        styles: Vec<super::style::StyleRun>,
+    },
+}
+
+/// How long a text edit lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextMode {
+    /// Drawn once; it stays (and scrolls with the screen) until the
+    /// recording draws over those cells.
+    #[default]
+    UntilDrawnOver,
+
+    /// Wherever `from` appears on screen, from `at` until event `until`
+    /// (the end when omitted) - surviving repaints and scrolling.
+    Everywhere {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<usize>,
+        #[serde(default, skip_serializing_if = "Occurrences::is_every")]
+        occurrences: Occurrences,
+    },
+}
+
+impl TextMode {
+    fn is_default(&self) -> bool {
+        *self == TextMode::UntilDrawnOver
+    }
+}
+
+/// Which occurrences of the text an "everywhere" edit changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Occurrences {
+    /// Every occurrence on screen.
+    #[default]
+    Every,
+    /// Only the one nearest where the edit was made.
+    Nearest,
+}
+
+impl Occurrences {
+    fn is_every(&self) -> bool {
+        *self == Occurrences::Every
+    }
 }
 
 /// Something inserted into the timeline.
@@ -196,7 +256,8 @@ pub fn apply_header(original: &Header, edits: &[Edit]) -> Header {
             | Edit::CapIdle { .. }
             | Edit::Delete { .. }
             | Edit::Insert { .. }
-            | Edit::Replace { .. } => {}
+            | Edit::Replace { .. }
+            | Edit::Text { .. } => {}
         }
     }
 
@@ -297,7 +358,8 @@ impl EditList {
             | Edit::CapIdle { .. }
             | Edit::Delete { .. }
             | Edit::Insert { .. }
-            | Edit::Replace { .. } => {}
+            | Edit::Replace { .. }
+            | Edit::Text { .. } => {}
 
             // header edits: one of each kind
             _ => {
@@ -442,6 +504,61 @@ impl Edit {
             Edit::Replace { from, to, ref clip } => {
                 check_range(from, to)?;
                 validate_clip(clip, event_count)
+            }
+
+            Edit::Text {
+                at,
+                ref from,
+                ref to,
+                mode,
+                ref styles,
+                ..
+            } => {
+                if at > event_count {
+                    bail!("text edit position {at} out of range (0..={event_count})");
+                }
+
+                let styled: usize = styles.iter().map(|r| r.len).sum();
+
+                if !styles.is_empty() && styled != to.chars().count() {
+                    bail!(
+                        "a text edit's styles cover {styled} characters, but its text has {}",
+                        to.chars().count()
+                    );
+                }
+
+                // (an "until drawn over" edit may insert, replacing nothing)
+                if from.is_empty() && (to.is_empty() || matches!(mode, TextMode::Everywhere { .. }))
+                {
+                    bail!("a text edit needs the text it changes");
+                }
+
+                if from.contains(['\n', '\r']) || to.contains(['\n', '\r']) {
+                    bail!("a text edit changes text on one line");
+                }
+
+                if matches!(mode, TextMode::Everywhere { .. }) && from.trim().is_empty() {
+                    bail!("to change text wherever it appears, it can't be just spaces");
+                }
+
+                // the new text would be found and changed again, growing each time
+                // (the same text, restyled, is fine: it doesn't grow)
+                if matches!(mode, TextMode::Everywhere { .. })
+                    && to != from
+                    && to.contains(from.as_str())
+                {
+                    bail!(
+                        "to change text wherever it appears, the new text can't contain the old (\"{to}\" contains \"{from}\")"
+                    );
+                }
+
+                if let TextMode::Everywhere { until: Some(u), .. } = mode {
+                    if u < at || u > event_count {
+                        bail!("text edit end {u} must be between {at} and {event_count}");
+                    }
+                }
+
+                Ok(())
             }
         }
     }
@@ -916,6 +1033,74 @@ mod tests {
             json,
             serde_json::json!({"op": "insert", "at": 10, "clip": {"kind": "recording", "from": 2, "to": 4}})
         );
+    }
+
+    #[test]
+    fn text_edits() {
+        use super::{Occurrences, TextMode};
+
+        let t = |at: usize, from: &str, to: &str, mode: TextMode| Edit::Text {
+            at,
+            row: 1,
+            col: 4,
+            from: from.to_owned(),
+            to: to.to_owned(),
+            mode,
+            styles: Vec::new(),
+        };
+
+        let mut list = EditList::new(10);
+        let edit = t(3, "hunter2", "*******", TextMode::UntilDrawnOver);
+
+        list.push(edit.clone()).unwrap();
+        list.push(edit.clone()).unwrap();
+        assert_eq!(list.edits.len(), 2, "text edits never coalesce");
+
+        assert_eq!(
+            serde_json::to_value(&edit).unwrap(),
+            serde_json::json!({"op": "text", "at": 3, "row": 1, "col": 4, "from": "hunter2", "to": "*******"})
+        );
+
+        let everywhere = t(
+            3,
+            "hunter2",
+            "*******",
+            TextMode::Everywhere {
+                until: Some(8),
+                occurrences: Occurrences::Nearest,
+            },
+        );
+        let json = serde_json::to_value(&everywhere).unwrap();
+        assert_eq!(
+            json["mode"],
+            serde_json::json!({"kind": "everywhere", "until": 8, "occurrences": "nearest"})
+        );
+        assert_eq!(serde_json::from_value::<Edit>(json).unwrap(), everywhere);
+
+        let bad = |e: Edit| EditList::new(10).push(e).is_err();
+        assert!(bad(t(11, "a", "b", TextMode::UntilDrawnOver)));
+        // an insert (replacing nothing) is fine until drawn over, not everywhere
+        assert!(!bad(t(3, "", "b", TextMode::UntilDrawnOver)));
+        assert!(bad(t(3, "", "", TextMode::UntilDrawnOver)));
+        assert!(bad(t(
+            3,
+            "",
+            "b",
+            TextMode::Everywhere {
+                until: None,
+                occurrences: Occurrences::Every,
+            }
+        )));
+        assert!(bad(t(3, "a", "b\nc", TextMode::UntilDrawnOver)));
+        assert!(bad(t(
+            3,
+            "a",
+            "b",
+            TextMode::Everywhere {
+                until: Some(2),
+                occurrences: Occurrences::Every,
+            }
+        )));
     }
 
     #[test]

@@ -25,6 +25,7 @@ const MARKER: Color = Color::Magenta;
 const SELECTION_BG: Color = Color::Indexed(24);
 const CLIP: Color = Color::Magenta;
 const CUT: Color = Color::Red;
+const TEXT_EDIT: Color = Color::LightGreen;
 const DIM: Color = Color::DarkGray;
 const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -62,7 +63,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
 
     // The metadata panel sits beside the preview so changes are visible live;
     // on narrow terminals it takes the preview's place.
-    let (preview_box, meta_box) = if app.meta.is_some() || app.fx.is_some() {
+    let (preview_box, meta_box) = if app.meta.is_some() || app.fx.is_some() || app.text.is_some() {
         if preview_box.width >= super::meta::PANEL_WIDTH + 24 {
             let [p, m] = Layout::horizontal([
                 Constraint::Min(20),
@@ -120,7 +121,9 @@ pub fn draw(frame: &mut Frame, app: &App) -> Areas {
     };
 
     let meta = meta_box.map_or(Rect::default(), |m| {
-        if app.fx.is_some() {
+        if app.text.is_some() {
+            super::textedit::draw(frame.buffer_mut(), m, app)
+        } else if app.fx.is_some() {
             super::fxpanel::draw(frame.buffer_mut(), m, app)
         } else {
             super::meta::draw(frame.buffer_mut(), m, app)
@@ -188,10 +191,39 @@ fn draw_preview(buf: &mut Buffer, area: Rect, app: &App) {
     let theme = app.timeline.header.term_theme.as_ref();
     let cursor = app.timeline.header.term_cursor;
 
-    // an effect being previewed plays over the frozen screen
-    match super::fxpanel::preview_screen(app) {
-        Some(vt) => draw_screen(buf, area, &vt, offset, theme, cursor),
-        None => draw_screen(buf, area, &app.vt(), offset, theme, cursor),
+    // an effect being previewed plays over the frozen screen; a text edit
+    // being typed shows in place
+    if let Some(vt) = super::textedit::preview_screen(app) {
+        draw_screen(buf, area, &vt, offset, theme, cursor);
+    } else {
+        match super::fxpanel::preview_screen(app) {
+            Some(vt) => draw_screen(buf, area, &vt, offset, theme, cursor),
+            None => draw_screen(buf, area, &app.vt(), offset, theme, cursor),
+        }
+    }
+
+    // a recorded screen cell's position in the preview, if it's showing
+    let cell_pos = |x: usize, y: usize| -> Option<(u16, u16)> {
+        let (sx, sy) = (x.checked_sub(offset.0)?, y.checked_sub(offset.1)?);
+
+        (sx < w && sy < h).then(|| (area.x + sx as u16, area.y + sy as u16))
+    };
+
+    // the text editor's selection and cursor
+    if let Some(o) = super::textedit::overlay(app) {
+        let (cx, cy) = o.cursor;
+
+        if let Some((r, a, b)) = o.selection {
+            for x in a..=b {
+                if let Some(cell) = cell_pos(x, r).and_then(|p| buf.cell_mut(p)) {
+                    cell.set_bg(SELECTION_BG);
+                }
+            }
+        }
+
+        if let Some(cell) = cell_pos(cx, cy).and_then(|p| buf.cell_mut(p)) {
+            cell.set_style(Style::default().fg(Color::Black).bg(ACCENT));
+        }
     }
 
     // the region being chosen for an effect
@@ -459,6 +491,7 @@ fn draw_time_view(buf: &mut Buffer, area: Rect, app: &App) {
     let mut markers = vec![false; w as usize];
     let mut clip = vec![false; w as usize];
     let mut cut = vec![false; w as usize];
+    let mut text_edit = vec![false; w as usize];
     let first = app
         .timeline
         .position_at(start.saturating_sub(Duration::from_nanos(1)));
@@ -494,6 +527,7 @@ fn draw_time_view(buf: &mut Buffer, area: Rect, app: &App) {
         };
         let x = x as usize;
         cut[x] |= is_cut(app, i);
+        text_edit[x] |= matches!(app.timeline.origin(i), Some(Origin::TextEdit { .. }));
         counts[x] += 1;
         edited[x] |= app.timeline.is_retimed(i);
         selected[x] |= in_selection(app, i);
@@ -524,6 +558,17 @@ fn draw_time_view(buf: &mut Buffer, area: Rect, app: &App) {
                 1,
                 '✂',
                 style.fg(CUT).add_modifier(Modifier::BOLD),
+            );
+        }
+
+        if text_edit[x] {
+            put(
+                buf,
+                area,
+                x as u16,
+                1,
+                '✎',
+                style.fg(TEXT_EDIT).add_modifier(Modifier::BOLD),
             );
         }
 
@@ -658,6 +703,9 @@ fn draw_event_view(buf: &mut Buffer, area: Rect, app: &App) {
 
         let (glyph, glyph_style) = match (app.timeline.origin(i), data) {
             (Some(Origin::Cut { .. }), _) => ('✂', style.fg(CUT).add_modifier(Modifier::BOLD)),
+            (Some(Origin::TextEdit { .. }), _) => {
+                ('✎', style.fg(TEXT_EDIT).add_modifier(Modifier::BOLD))
+            }
             (Some(Origin::Clip { .. }), _) => ('▒', style.fg(CLIP)),
             (_, EventData::Marker(_)) => (event_glyph(data), style.fg(MARKER)),
             _ => (event_glyph(data), style),
@@ -739,6 +787,14 @@ fn status_line(app: &App) -> Line<'static> {
             format!("in inserted clip #{insert} (d removes it)"),
             Style::default().fg(CLIP),
         ));
+    } else if let Some(Origin::TextEdit { edit }) =
+        app.current_frame().and_then(|i| app.timeline.origin(i))
+    {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("✎ text edit #{edit} (d removes it)"),
+            Style::default().fg(TEXT_EDIT),
+        ));
     } else if let Some(e) = app.target_event() {
         let now = app.timeline.event_delay(e).unwrap_or_default();
         let was = app.timeline.original_event_delay(e).unwrap_or_default();
@@ -795,6 +851,17 @@ fn help_line(app: &App) -> Line<'static> {
     // Messages temporarily replace the key hints, which are always in `?`.
     let message = app.message();
 
+    if let (Some(ed), None) = (&app.text, message) {
+        let mut spans = Vec::new();
+
+        for (k, what) in super::textedit::hints(ed) {
+            spans.push(Span::styled(*k, Style::default().fg(PLAYHEAD)));
+            spans.push(Span::styled(format!(" {what}  "), Style::default().fg(DIM)));
+        }
+
+        return Line::from(spans);
+    }
+
     if let (Some(panel), None) = (&app.fx, message) {
         let mut spans = Vec::new();
 
@@ -836,6 +903,7 @@ fn help_line(app: &App) -> Line<'static> {
         ("d", "cut"),
         ("i", "insert"),
         ("x", "effect"),
+        ("e", "edit text"),
         ("t", "view"),
         ("f", "full"),
         ("m", "metadata"),
@@ -882,6 +950,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("D", "restore a cut (✂), or part of it"),
     ("i", "insert: hold, blank, text, recording, copy"),
     ("x", "insert a text effect (ttfx / tte)"),
+    ("e", "edit text on this frame"),
     ("View", ""),
     ("t", "switch time view / event view"),
     ("m", "metadata: title, idle limit, colors, cursor…"),

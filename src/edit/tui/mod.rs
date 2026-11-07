@@ -4,6 +4,7 @@ mod app;
 mod color;
 mod fxpanel;
 mod meta;
+mod textedit;
 mod ui;
 
 use std::io;
@@ -130,6 +131,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.text.is_some() {
+        textedit::handle_key(app, key);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => app.quit = true,
 
@@ -175,6 +181,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('C') => meta::open_cursor_picker(app),
         KeyCode::Char('m') => meta::open(app),
         KeyCode::Char('x') => fxpanel::open(app),
+        KeyCode::Char('e') => textedit::open(app),
         KeyCode::Char('(') => app.zoom_by(2.0),
         KeyCode::Char(')') => app.zoom_by(0.5),
         KeyCode::Char('f') => app.fullscreen = !app.fullscreen,
@@ -211,6 +218,28 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, areas: Areas) {
     if app.meta.is_some() && contains(areas.meta, mx, my) {
         meta::handle_mouse(app, mouse, areas.meta);
         return;
+    }
+
+    if app.text.is_some() {
+        if contains(areas.meta, mx, my) {
+            textedit::handle_panel_mouse(app, mouse, areas.meta);
+            return;
+        }
+
+        let p = areas.preview;
+        let (ox, oy) = app.viewport_offset(p.width as usize, p.height as usize);
+        let (cols, rows) = app.vt().size();
+        let cell = contains(p, mx, my).then(|| {
+            (
+                (ox + (mx - p.x) as usize).min(cols.saturating_sub(1)),
+                (oy + (my - p.y) as usize).min(rows.saturating_sub(1)),
+            )
+        });
+
+        if contains(p, mx, my) || matches!(mouse.kind, MouseEventKind::Up(_)) {
+            textedit::handle_preview_mouse(app, mouse, cell);
+            return;
+        }
     }
 
     if app.fx.is_some() {

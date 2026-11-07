@@ -9,6 +9,7 @@ pub mod edits;
 pub mod fx;
 pub mod render;
 pub mod retime;
+pub mod style;
 pub mod themes;
 pub mod timeline;
 pub mod tui;

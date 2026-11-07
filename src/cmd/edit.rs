@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::asciicast::{self, CursorShape, EventData};
 use crate::cli;
+use crate::edit::edits::{Occurrences, TextMode};
 use crate::edit::timeline::Origin;
 use crate::edit::{fx, render, tui, Clip, Edit, EditList, Timeline};
 use crate::status;
@@ -33,6 +34,14 @@ impl cli::Edit {
 
         let mut edits = EditList::load_or_new(&edits_path, timeline.original_len())?;
         let mut changed = self.update_edits(&mut edits)?;
+
+        if let Some(arg) = &self.edit_text {
+            let edit = self.text_edit(arg, &timeline)?;
+            let description = describe(&edit);
+            edits.push(edit)?;
+            status::info!("Added {description}");
+            changed = true;
+        }
 
         let effect = match (&self.insert_effect, &self.replace_effect) {
             (Some(_), Some(_)) => bail!("use --insert-effect or --replace-effect, not both"),
@@ -218,6 +227,165 @@ impl cli::Edit {
         Ok(())
     }
 
+    /// Parses `AT[@ROW,COL]:FROM=>TO`, finding FROM on the screen at AT.
+    fn text_edit(&self, arg: &str, timeline: &Timeline) -> Result<Edit> {
+        let err = || anyhow!("invalid --edit-text '{arg}', expected AT[@ROW,COL]:FROM=>TO");
+        let (place, change) = arg.split_once(':').ok_or_else(err)?;
+        let (from, to) = change.split_once("=>").ok_or_else(err)?;
+
+        let (at, spot) = match place.split_once('@') {
+            Some((at, spot)) => {
+                let (r, c) = spot.split_once(',').ok_or_else(err)?;
+                let num = |v: &str| v.trim().parse::<usize>().map_err(|_| err());
+                (at, Some((num(r)?, num(c)?)))
+            }
+            None => (place, None),
+        };
+
+        let at = parse_at(at, timeline.original_len())?;
+        let screen = timeline.original_vt_at(at);
+        let lines = screen.text();
+        let from_chars: Vec<char> = from.chars().collect();
+
+        let found = lines.iter().enumerate().find_map(|(r, line)| {
+            let chars: Vec<char> = line.chars().collect();
+            (0..chars.len())
+                .find(|&c| chars[c..].starts_with(&from_chars))
+                .map(|c| (r, c))
+        });
+
+        let (row, col) = match spot {
+            Some((r, c)) => {
+                let here: String = lines
+                    .get(r)
+                    .map(|l| l.chars().skip(c).take(from_chars.len()).collect())
+                    .unwrap_or_default();
+
+                if here != from {
+                    status::warning!("The screen at {r},{c} shows \"{here}\", not \"{from}\"; changing it anyway");
+                }
+
+                (r, c)
+            }
+
+            // "everywhere" finds the text whenever it shows up; it needn't be there yet
+            None => match (found, self.text_everywhere) {
+                (Some(spot), _) => spot,
+                (None, true) => (0, 0),
+                (None, false) => bail!(
+                    "\"{from}\" isn't on the screen at {at}; give its position with AT@ROW,COL"
+                ),
+            },
+        };
+
+        // the look of the new text: FROM's own style, with any changes asked for
+        let cell_style = |r: usize, c: usize| {
+            let pen = screen
+                .view()
+                .nth(r)
+                .and_then(|l| l.cells().get(c).map(|cell| *cell.pen()))
+                .unwrap_or_default();
+
+            crate::edit::style::TextStyle::from_pen(&pen)
+        };
+
+        let restyled = self.text_fg.is_some()
+            || self.text_bg.is_some()
+            || self.text_bold
+            || self.text_italic
+            || self.text_underline;
+
+        let mut new_style = cell_style(row, col);
+
+        if let Some(c) = &self.text_fg {
+            new_style.fg = Some(crate::edit::style::StyleColor::parse(c)?);
+        }
+
+        if let Some(c) = &self.text_bg {
+            new_style.bg = Some(crate::edit::style::StyleColor::parse(c)?);
+        }
+
+        new_style.bold |= self.text_bold;
+        new_style.italic |= self.text_italic;
+        new_style.underline |= self.text_underline;
+
+        let mode = if self.text_everywhere {
+            TextMode::Everywhere {
+                until: self.text_until,
+                occurrences: if self.text_nearest {
+                    Occurrences::Nearest
+                } else {
+                    Occurrences::Every
+                },
+            }
+        } else {
+            if self.text_until.is_some() || self.text_nearest {
+                bail!("--text-until and --text-nearest need --text-everywhere");
+            }
+
+            TextMode::UntilDrawnOver
+        };
+
+        let to_len = to.chars().count();
+
+        // until drawn over, a different length moves the rest of the line
+        // along: the change then runs to the end of the line's text, which
+        // keeps its own styles
+        let shifted = matches!(mode, TextMode::UntilDrawnOver) && to_len != from_chars.len();
+
+        let (from, to, styles) = if shifted {
+            let line: Vec<char> = lines
+                .get(row)
+                .map(|l| l.chars().collect())
+                .unwrap_or_default();
+            let end = line
+                .iter()
+                .rposition(|c| *c != ' ')
+                .map_or(0, |i| i + 1)
+                .max(col + from_chars.len());
+            let tail_start = (col + from_chars.len()).min(line.len());
+            let tail: String = line[tail_start..end.min(line.len())].iter().collect();
+            let old: String = line[col.min(line.len())..end.min(line.len())]
+                .iter()
+                .collect();
+
+            let mut styles = vec![
+                if restyled {
+                    new_style
+                } else {
+                    cell_style(row, col)
+                };
+                to_len
+            ];
+            styles.extend((tail_start..end).map(|c| cell_style(row, c)));
+
+            (
+                old,
+                format!("{to}{tail}"),
+                crate::edit::style::to_runs(&styles),
+            )
+        } else if restyled {
+            let styles = vec![new_style; to_len];
+            (
+                from.to_owned(),
+                to.to_owned(),
+                crate::edit::style::to_runs(&styles),
+            )
+        } else {
+            (from.to_owned(), to.to_owned(), Vec::new())
+        };
+
+        Ok(Edit::Text {
+            at,
+            row,
+            col,
+            from,
+            to,
+            mode,
+            styles,
+        })
+    }
+
     fn capture_effect(
         &self,
         arg: &str,
@@ -361,6 +529,7 @@ fn print_events(timeline: &Timeline) -> Result<()> {
                 format!("[jump cut over events {from}..{to}] "),
             ),
             Some(Origin::Clip { insert }) => (format!("+clip{insert}"), String::new()),
+            Some(Origin::TextEdit { edit }) => (format!("✎text{edit}"), String::new()),
             None => (String::new(), String::new()),
         };
 
@@ -478,6 +647,33 @@ pub(crate) fn describe(edit: &Edit) -> String {
         Edit::Insert { at, ref clip } => format!("insert {} at {at}", clip.describe()),
         Edit::Replace { from, to, ref clip } => {
             format!("replace events {from}..{to} with {}", clip.describe())
+        }
+        Edit::Text {
+            at,
+            row,
+            col,
+            ref from,
+            ref to,
+            mode,
+            ref styles,
+        } => {
+            let how = match mode {
+                TextMode::UntilDrawnOver => "until drawn over".to_owned(),
+                TextMode::Everywhere { until, occurrences } => format!(
+                    "wherever it appears{}{}",
+                    match occurrences {
+                        Occurrences::Every => "",
+                        Occurrences::Nearest => " (nearest only)",
+                    },
+                    until.map_or(String::new(), |u| format!(" until {u}"))
+                ),
+            };
+
+            let restyled = if styles.is_empty() { "" } else { ", restyled" };
+
+            format!(
+                "change \"{from}\" to \"{to}\" at row {row}, col {col} from {at}, {how}{restyled}"
+            )
         }
     }
 }
@@ -686,7 +882,7 @@ mod tests {
     use super::{frame_text, parse_range_op, parse_set_delay};
     use crate::asciicast::{self, EventData};
     use crate::cli;
-    use crate::edit::Edit;
+    use crate::edit::{Edit, Timeline};
 
     #[test]
     fn parse_args() {
@@ -753,6 +949,15 @@ mod tests {
             insert_cast: vec![],
             duplicate: vec![],
             insert_effect: None,
+            edit_text: None,
+            text_everywhere: false,
+            text_until: None,
+            text_nearest: false,
+            text_fg: None,
+            text_bg: None,
+            text_bold: false,
+            text_italic: false,
+            text_underline: false,
             replace_effect: None,
             fx_duration: None,
             fx_anchor: "c".to_owned(),
@@ -821,6 +1026,81 @@ mod tests {
         cmd.run().unwrap();
         let saved = fs::read_to_string(dir.path().join("demo.cast.edits.json")).unwrap();
         assert!(!saved.contains("delete"));
+    }
+
+    #[test]
+    fn edit_text_end_to_end() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("demo.cast");
+        let output = dir.path().join("out.cast");
+        fs::write(
+            &input,
+            concat!(
+                "{\"version\":3,\"term\":{\"cols\":20,\"rows\":4}}\n",
+                "[0.1, \"o\", \"user$ ls\\r\\n\"]\n",
+                "[0.1, \"o\", \"file\\r\\n\"]\n",
+                "[0.1, \"o\", \"user$ \"]\n",
+            ),
+        )
+        .unwrap();
+        let input_s = input.to_string_lossy().into_owned();
+
+        // until drawn over: found on the screen at that point
+        let mut cmd = edit_cmd(&input_s);
+        cmd.edit_text = Some("2:file=>data".to_owned());
+        cmd.run().unwrap();
+
+        // everywhere
+        let mut cmd = edit_cmd(&input_s);
+        cmd.edit_text = Some("0:user=>me".to_owned()); // not on screen yet: fine
+        cmd.text_everywhere = true;
+        cmd.render = Some(output.to_string_lossy().into_owned());
+        cmd.run().unwrap();
+
+        let tl = Timeline::load(asciicast::open_from_path(&output).unwrap()).unwrap();
+        let end: Vec<String> = tl
+            .vt_at_position(tl.len())
+            .text()
+            .iter()
+            .map(|l| l.trim_end().to_owned())
+            .collect();
+        assert_eq!(end[..3], ["me$ ls", "data", "me$"]);
+
+        // text that isn't there is an error; options need --text-everywhere
+        let mut cmd = edit_cmd(&input_s);
+        cmd.edit_text = Some("1:nope=>x".to_owned());
+        assert!(cmd.run().is_err());
+
+        let mut cmd = edit_cmd(&input_s);
+        cmd.edit_text = Some("1:user=>x".to_owned());
+        cmd.text_nearest = true;
+        assert!(cmd.run().is_err());
+    }
+
+    #[test]
+    fn edit_text_styles_from_the_command_line() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("demo.cast");
+        fs::copy("tests/casts/full-v2.cast", &input).unwrap();
+        let input_s = input.to_string_lossy().into_owned();
+
+        let mut cmd = edit_cmd(&input_s);
+        cmd.edit_text = Some("2:ółć=>OK".to_owned());
+        cmd.text_fg = Some("bright-green".to_owned());
+        cmd.text_bold = true;
+        cmd.run().unwrap();
+
+        let saved = fs::read_to_string(dir.path().join("demo.cast.edits.json")).unwrap();
+        assert!(
+            saved.contains("bright-green") && saved.contains("\"bold\": true"),
+            "{saved}"
+        );
+
+        // a bad colour is an error
+        let mut cmd = edit_cmd(&input_s);
+        cmd.edit_text = Some("2:ż=>Z".to_owned());
+        cmd.text_fg = Some("reddish".to_owned());
+        assert!(cmd.run().is_err());
     }
 
     #[test]

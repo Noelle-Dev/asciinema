@@ -261,6 +261,12 @@ pub enum Commands {
   asciinema edit demo.cast --insert-effect 30=rain --fx-region 0,2,40x3
       Rains in the 40x3 region at the screen's third row, before event 30
 
+  asciinema edit demo.cast --edit-text '29:hello world=>hi there'
+      Changes \"hello world\" on screen after event 29, until it's drawn over
+
+  asciinema edit demo.cast --edit-text '0:hunter2=>*******' --text-everywhere
+      Hides \"hunter2\" wherever it appears, for the whole recording
+
   asciinema edit demo.cast --cursor block
       Plays the recording back with a steady block cursor
 
@@ -798,6 +804,57 @@ pub struct Edit {
         long_help
     )]
     pub insert_effect: Option<String>,
+
+    /// Change text on screen from position AT (after AT events): FROM becomes TO, keeping the cells' style. FROM is looked up on the screen at that point (the first occurrence, or the one at ROW,COL, counting from 0). By default the change is drawn once and stays until the recording draws over it; see --text-everywhere. A shorter TO is padded with spaces; a longer one overwrites the cells after FROM.
+    #[arg(
+        long,
+        value_name = "AT[@ROW,COL]:FROM=>TO",
+        help = "Change text on screen",
+        long_help
+    )]
+    pub edit_text: Option<String>,
+
+    /// Make --edit-text apply wherever FROM appears on screen (surviving repaints and scrolling), from AT to the end or --text-until.
+    #[arg(long, help = "Text edit: wherever the text appears", long_help)]
+    pub text_everywhere: bool,
+
+    /// With --text-everywhere: stop before event N.
+    #[arg(long, value_name = "N", help = "Text edit: until event N", long_help)]
+    pub text_until: Option<usize>,
+
+    /// With --text-everywhere: change only the occurrence nearest ROW,COL (or FROM's first occurrence), not all of them.
+    #[arg(long, help = "Text edit: only the nearest occurrence", long_help)]
+    pub text_nearest: bool,
+
+    /// Text colour for --edit-text's new text: a name (red, bright-blue, ...), a palette number 0-255, or #rrggbb.
+    #[arg(
+        long,
+        value_name = "COLOUR",
+        help = "Text edit: text colour",
+        long_help
+    )]
+    pub text_fg: Option<String>,
+
+    /// Background colour for --edit-text's new text: a name, a palette number 0-255, or #rrggbb.
+    #[arg(
+        long,
+        value_name = "COLOUR",
+        help = "Text edit: background colour",
+        long_help
+    )]
+    pub text_bg: Option<String>,
+
+    /// Make --edit-text's new text bold.
+    #[arg(long, help = "Text edit: bold", long_help)]
+    pub text_bold: bool,
+
+    /// Make --edit-text's new text italic.
+    #[arg(long, help = "Text edit: italic", long_help)]
+    pub text_italic: bool,
+
+    /// Underline --edit-text's new text.
+    #[arg(long, help = "Text edit: underline", long_help)]
+    pub text_underline: bool,
 
     /// Play a text effect instead of events FROM..TO: they're cut, the effect animates the screen as it looked after them, and ends on that screen. Takes the same --fx-* options as --insert-effect.
     #[arg(
