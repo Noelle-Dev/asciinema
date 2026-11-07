@@ -244,7 +244,7 @@ impl cli::Edit {
 
         let at = parse_at(at, timeline.original_len())?;
         let screen = timeline.original_vt_at(at);
-        let lines = screen.text();
+        let lines = crate::edit::timeline::screen_text(&screen);
         let from_chars: Vec<char> = from.chars().collect();
 
         let found = lines.iter().enumerate().find_map(|(r, line)| {
@@ -326,54 +326,14 @@ impl cli::Edit {
             TextMode::UntilDrawnOver
         };
 
-        let to_len = to.chars().count();
-
-        // until drawn over, a different length moves the rest of the line
-        // along: the change then runs to the end of the line's text, which
-        // keeps its own styles
-        let shifted = matches!(mode, TextMode::UntilDrawnOver) && to_len != from_chars.len();
-
-        let (from, to, styles) = if shifted {
-            let line: Vec<char> = lines
-                .get(row)
-                .map(|l| l.chars().collect())
-                .unwrap_or_default();
-            let end = line
-                .iter()
-                .rposition(|c| *c != ' ')
-                .map_or(0, |i| i + 1)
-                .max(col + from_chars.len());
-            let tail_start = (col + from_chars.len()).min(line.len());
-            let tail: String = line[tail_start..end.min(line.len())].iter().collect();
-            let old: String = line[col.min(line.len())..end.min(line.len())]
-                .iter()
-                .collect();
-
-            let mut styles = vec![
-                if restyled {
-                    new_style
-                } else {
-                    cell_style(row, col)
-                };
-                to_len
-            ];
-            styles.extend((tail_start..end).map(|c| cell_style(row, c)));
-
-            (
-                old,
-                format!("{to}{tail}"),
-                crate::edit::style::to_runs(&styles),
-            )
-        } else if restyled {
-            let styles = vec![new_style; to_len];
-            (
-                from.to_owned(),
-                to.to_owned(),
-                crate::edit::style::to_runs(&styles),
-            )
+        // just the changed text: playback moves the rest of the line along
+        let styles = if restyled {
+            crate::edit::style::to_runs(&vec![new_style; to.chars().count()])
         } else {
-            (from.to_owned(), to.to_owned(), Vec::new())
+            Vec::new()
         };
+
+        let (from, to) = (from.to_owned(), to.to_owned());
 
         Ok(Edit::Text {
             at,
@@ -584,7 +544,7 @@ fn print_frame(timeline: &Timeline, secs: f64) -> Result<()> {
             .map_or("-".to_owned(), |p| p.to_string())
     );
 
-    print!("{}", frame_text(&vt.text()));
+    print!("{}", frame_text(&crate::edit::timeline::screen_text(&vt)));
 
     Ok(())
 }

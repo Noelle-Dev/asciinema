@@ -707,15 +707,33 @@ impl Timeline {
             out.push((k, s));
         };
 
+        // positions "until drawn over" edits are following on the unedited
+        // screen (None: not started, or ended)
+        let mut tracks: Vec<Option<(usize, usize)>> = vec![None; edits.len()];
+
+        // rows edits have rebuilt from the unedited screen
+        let mut rebuilt: std::collections::BTreeSet<usize> = Default::default();
+
         for p in 0..=n {
-            // edits starting here
+            // edits starting here: the rows they change straight away
+            let mut start_rows: Vec<usize> = Vec::new();
+            let mut started: Option<usize> = None;
+
             for (k, e) in edits.iter().enumerate().filter(|(_, e)| e.at == p) {
+                started.get_or_insert(k);
+
                 match e.mode {
+                    // follow the text while it's on screen: whenever the
+                    // recording touches its line, it's rebuilt with the change
+                    TextMode::UntilDrawnOver if shows(&plain, e.row, e.col, &e.from) => {
+                        tracks[k] = Some((e.row, e.col));
+                        start_rows.push(e.row);
+                    }
+
+                    // nothing to follow (an insert, or text that's only on
+                    // the edited screen): draw it once, moving the cursor along
                     TextMode::UntilDrawnOver => {
                         let mut s = shifted_patch(&vt, e);
-
-                        // a cursor after the change on its line moves along with
-                        // the text, so what's typed next lands in the right place
                         let c = vt.cursor();
                         let (from, to) = (e.from.len(), e.to.chars().count());
 
@@ -727,18 +745,22 @@ impl Timeline {
                         draw(&mut vt, &mut items, &mut pre[p], k, s);
                     }
 
-                    TextMode::Everywhere { .. } => {
-                        let all: Vec<usize> = (0..vt.size().1).collect();
-                        let active = active_everywhere(&edits, p, n);
+                    TextMode::Everywhere { .. } => start_rows.extend(0..vt.size().1),
+                }
+            }
 
-                        for (_, s) in everywhere_patches(&plain, &vt, &active, &all) {
-                            draw(&mut vt, &mut items, &mut pre[p], k, s);
-                        }
+            if let Some(k) = started {
+                let active = active_edits(&edits, &tracks, &plain, p, n);
+                start_rows.sort_unstable();
+                start_rows.dedup();
 
-                        if let Some(s) = everywhere_cursor(&plain, &vt, &active) {
-                            draw(&mut vt, &mut items, &mut pre[p], k, s);
-                        }
-                    }
+                for (k, s, r) in line_patches(&plain, &vt, &active, &start_rows) {
+                    draw(&mut vt, &mut items, &mut pre[p], k, s);
+                    rebuilt.insert(r);
+                }
+
+                if let Some(s) = edited_cursor(&plain, &vt, &active) {
+                    draw(&mut vt, &mut items, &mut pre[p], k, s);
                 }
             }
 
@@ -763,21 +785,44 @@ impl Timeline {
                 _ => Vec::new(),
             };
 
-            // "everywhere" edits: wherever the text shows up in what changed
-            let active = active_everywhere(&edits, p + 1, n);
-
-            if changed.is_empty() && active.is_empty() {
-                continue;
-            }
-
-            for (k, s) in everywhere_patches(&plain, &vt, &active, &changed) {
-                draw(&mut vt, &mut items, &mut post[p], k, s);
-            }
-
-            if let Some((k, _)) = active.first() {
-                if let Some(s) = everywhere_cursor(&plain, &vt, &active) {
-                    draw(&mut vt, &mut items, &mut post[p], *k, s);
+            // edits following their text: still there? (an edit whose text
+            // was drawn over ends; its line has changed, so it's redrawn
+            // without it below)
+            for (k, e) in edits.iter().enumerate() {
+                if let Some(at) = tracks[k] {
+                    tracks[k] = follow(&plain, at, &e.from);
                 }
+            }
+
+            let active = active_edits(&edits, &tracks, &plain, p + 1, n);
+
+            for (k, s, r) in line_patches(&plain, &vt, &active, &changed) {
+                draw(&mut vt, &mut items, &mut post[p], k, s);
+                rebuilt.insert(r);
+            }
+
+            // a changed line that an edit rebuilt, but that no edit applies to
+            // any more (its text was drawn over), gets the recording's own
+            // content back, and so does the cursor
+            let leftovers: Vec<usize> = changed
+                .iter()
+                .copied()
+                .filter(|r| rebuilt.contains(r))
+                .collect();
+
+            for (s, cursor_row) in restore_lines(&plain, &vt, &active, &leftovers) {
+                let k = active.first().map_or(0, |a| a.0);
+                draw(&mut vt, &mut items, &mut post[p], k, s);
+
+                if cursor_row {
+                    let c = plain.cursor();
+                    let s = format!("\x1b[{};{}H", c.row + 1, c.col + 1);
+                    draw(&mut vt, &mut items, &mut post[p], k, s);
+                }
+            }
+
+            if let Some(s) = edited_cursor(&plain, &vt, &active) {
+                draw(&mut vt, &mut items, &mut post[p], active[0].0, s);
             }
         }
 
@@ -952,16 +997,262 @@ fn find_text(line: &avt::Line, from: &[char]) -> Vec<usize> {
     found
 }
 
-/// The "everywhere" edits in effect after `p` events: (index, edit).
-fn active_everywhere(edits: &[TextEdit], p: usize, n: usize) -> Vec<(usize, &TextEdit)> {
+/// How an active text edit applies, in the unedited screen's coordinates.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// Every occurrence of the text.
+    Every,
+    /// Only this occurrence (the one nearest where the edit was made).
+    Nearest(Option<(usize, usize)>),
+    /// The occurrence an "until drawn over" edit is following: (row, col).
+    At(usize, usize),
+}
+
+/// Text edits in effect after `p` events, with how each applies. `tracks`
+/// are the positions "until drawn over" edits are following (None: not
+/// started, or ended).
+fn active_edits<'a>(
+    edits: &'a [TextEdit],
+    tracks: &[Option<(usize, usize)>],
+    plain: &Vt,
+    p: usize,
+    n: usize,
+) -> Vec<(usize, &'a TextEdit, Target)> {
+    let rows = plain.size().1;
+
     edits
         .iter()
         .enumerate()
-        .filter(|(_, e)| match e.mode {
-            TextMode::Everywhere { until, .. } => e.at <= p && p <= until.unwrap_or(n),
-            TextMode::UntilDrawnOver => false,
+        .filter_map(|(k, e)| match e.mode {
+            TextMode::Everywhere { until, occurrences } => {
+                if e.at > p || p > until.unwrap_or(n) {
+                    return None;
+                }
+
+                Some(match occurrences {
+                    Occurrences::Every => (k, e, Target::Every),
+
+                    // the occurrence closest to where the edit was made
+                    Occurrences::Nearest => {
+                        let nearest = (0..rows)
+                            .flat_map(|r| {
+                                find_text(plain.line(r), &e.from)
+                                    .into_iter()
+                                    .map(move |c| (r, c))
+                            })
+                            .min_by_key(|&(r, c)| r.abs_diff(e.row) * 1000 + c.abs_diff(e.col));
+
+                        (k, e, Target::Nearest(nearest))
+                    }
+                })
+            }
+
+            TextMode::UntilDrawnOver => tracks[k].map(|(r, c)| (k, e, Target::At(r, c))),
         })
         .collect()
+}
+
+/// Whether the unedited screen shows `from` at row `r`, column `c`.
+fn shows(plain: &Vt, r: usize, c: usize, from: &[char]) -> bool {
+    let (_, rows) = plain.size();
+
+    if r >= rows || from.is_empty() {
+        return false;
+    }
+
+    let line: Vec<char> = plain
+        .line(r)
+        .cells()
+        .iter()
+        .filter(|c| c.width() > 0)
+        .map(|c| c.char())
+        .collect();
+
+    line.get(c..c + from.len()) == Some(from)
+}
+
+/// Where an "until drawn over" edit's text is now: still in place, or moved
+/// to another row in the same column (the screen scrolled). `None` once it's
+/// gone - drawn over.
+fn follow(plain: &Vt, (r, c): (usize, usize), from: &[char]) -> Option<(usize, usize)> {
+    if shows(plain, r, c, from) {
+        return Some((r, c));
+    }
+
+    (0..plain.size().1)
+        .filter(|&row| shows(plain, row, c, from))
+        .min_by_key(|&row| row.abs_diff(r))
+        .map(|row| (row, c))
+}
+
+/// Moves a column of the unedited screen through earlier replacements on its
+/// line (each pass: starts, from length, to length).
+fn map_col(mut col: usize, passes: &[(Vec<usize>, usize, usize)]) -> usize {
+    for (starts, from, to) in passes {
+        let mut shift: isize = 0;
+
+        for &s in starts {
+            if s + from <= col {
+                shift += *to as isize - *from as isize;
+            } else if s <= col {
+                // inside a changed span: keep it within the new text
+                shift += ((*to).min(col - s) as isize) - (col - s) as isize;
+            }
+        }
+
+        col = col.saturating_add_signed(shift);
+    }
+
+    col
+}
+
+/// Row `r` of the unedited screen with every active edit applied in turn.
+/// `None` when none of them is on the line; else the new cells, the first
+/// changed column, the edit that changed it first, and each pass's (starts,
+/// from length, to length) - for mapping columns.
+#[allow(clippy::type_complexity)]
+fn rebuild_line(
+    plain: &Vt,
+    r: usize,
+    active: &[(usize, &TextEdit, Target)],
+) -> Option<(
+    Vec<(char, super::style::TextStyle)>,
+    usize,
+    usize,
+    Vec<(Vec<usize>, usize, usize)>,
+)> {
+    use super::style::TextStyle;
+
+    let mut cells: Vec<(char, TextStyle)> = plain
+        .line(r)
+        .cells()
+        .iter()
+        .filter(|c| c.width() > 0)
+        .map(|c| (c.char(), TextStyle::from_pen(c.pen())))
+        .collect();
+
+    let mut first: Option<(usize, usize)> = None; // (col, edit index)
+    let mut passes: Vec<(Vec<usize>, usize, usize)> = Vec::new();
+
+    for (k, e, target) in active {
+        let line: Vec<char> = cells.iter().map(|c| c.0).collect();
+        let found = find_chars(&line, &e.from);
+
+        // positions are in the unedited screen's columns; earlier passes may
+        // have moved them along
+        let at = |col: usize| map_col(col, &passes);
+
+        let starts: Vec<usize> = match *target {
+            Target::Every => found,
+            Target::Nearest(Some((nr, nc))) if nr == r => {
+                found.into_iter().filter(|&c| c == at(nc)).collect()
+            }
+            Target::At(ar, ac) if ar == r => found.into_iter().filter(|&c| c == at(ac)).collect(),
+            _ => Vec::new(),
+        };
+
+        if starts.is_empty() {
+            continue;
+        }
+
+        let col = starts[0];
+        first = Some(match first {
+            Some((c, k0)) if c <= col => (c, k0),
+            _ => (col, *k),
+        });
+
+        cells = replace_in(&cells, &starts, e);
+        passes.push((starts, e.from.len(), e.to.chars().count()));
+    }
+
+    let (col, k) = first?;
+
+    Some((cells, col, k, passes))
+}
+
+/// Patches for active text edits on rows `rows`: each line is rebuilt from
+/// the unedited screen `plain` with every active edit applied in turn (the
+/// rest of the line moving along when lengths differ), and drawn onto the
+/// edited screen `vt`. Returns (edit index, patch, row) per line.
+fn line_patches(
+    plain: &Vt,
+    vt: &Vt,
+    active: &[(usize, &TextEdit, Target)],
+    rows: &[usize],
+) -> Vec<(usize, String, usize)> {
+    let (cols, height) = plain.size();
+
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    let mut patches = Vec::new();
+
+    for &r in rows.iter().filter(|&&r| r < height) {
+        let Some((mut cells, col, k, _)) = rebuild_line(plain, r, active) else {
+            continue;
+        };
+
+        cells.resize(cols, (' ', super::style::TextStyle::default()));
+        cells.truncate(cols);
+
+        let (text, styles): (String, Vec<_>) = cells[col..].iter().copied().unzip();
+        patches.push((k, text_patch(vt, r, col, cols - col, &text, &styles), r));
+    }
+
+    patches
+}
+
+/// Redraws, from the unedited screen, changed rows that no active edit
+/// applies to but that still differ (leftovers of an edit that has ended).
+/// Returns (patch, whether it's the cursor's row) per row.
+fn restore_lines(
+    plain: &Vt,
+    vt: &Vt,
+    active: &[(usize, &TextEdit, Target)],
+    changed: &[usize],
+) -> Vec<(String, bool)> {
+    use super::style::TextStyle;
+
+    let (cols, rows) = plain.size();
+    let cells = |v: &Vt, r: usize| -> Vec<(char, TextStyle)> {
+        v.line(r)
+            .cells()
+            .iter()
+            .filter(|c| c.width() > 0)
+            .map(|c| (c.char(), TextStyle::from_pen(c.pen())))
+            .collect()
+    };
+
+    changed
+        .iter()
+        .filter(|&&r| r < rows && rebuild_line(plain, r, active).is_none())
+        .filter_map(|&r| {
+            let want = cells(plain, r);
+            let have = cells(vt, r);
+            let first = want.iter().zip(&have).position(|(a, b)| a != b)?;
+
+            let (text, styles): (String, Vec<TextStyle>) = want[first..].iter().copied().unzip();
+            let patch = text_patch(vt, r, first, cols - first, &text, &styles);
+
+            Some((patch, plain.cursor().row == r))
+        })
+        .collect()
+}
+
+/// Moves the edited screen's cursor to where the unedited screen's cursor
+/// is, adjusted for changes before it on its line - so what the recording
+/// types next lands after the changed text, even when it positions the
+/// cursor itself (as full-screen programs like vim do). `None` if it's
+/// already there, or its line has no change.
+fn edited_cursor(plain: &Vt, vt: &Vt, active: &[(usize, &TextEdit, Target)]) -> Option<String> {
+    let c = plain.cursor();
+    let (_, _, _, passes) = rebuild_line(plain, c.row, active)?;
+
+    let col = map_col(c.col, &passes).min(vt.size().0 - 1);
+    let now = vt.cursor();
+
+    ((now.row, now.col) != (c.row, col)).then(|| format!("\x1b[{};{}H", c.row + 1, col + 1))
 }
 
 /// An "until drawn over" edit on the current screen: `e.to` replaces the
@@ -991,156 +1282,6 @@ fn shifted_patch(vt: &Vt, e: &TextEdit) -> String {
     let (text, styles): (String, Vec<TextStyle>) = line[e.col..].iter().copied().unzip();
 
     text_patch(vt, e.row, e.col, cols - e.col, &text, &styles)
-}
-
-/// Where "nearest" edits apply: the occurrence closest to where each edit
-/// was made, anywhere on the (unedited) screen.
-fn nearest_targets(plain: &Vt, active: &[(usize, &TextEdit)]) -> Vec<Option<(usize, usize)>> {
-    let rows = plain.size().1;
-
-    active
-        .iter()
-        .map(|(_, e)| match e.mode {
-            TextMode::Everywhere {
-                occurrences: Occurrences::Nearest,
-                ..
-            } => (0..rows)
-                .flat_map(|r| {
-                    find_text(plain.line(r), &e.from)
-                        .into_iter()
-                        .map(move |c| (r, c))
-                })
-                .min_by_key(|&(r, c)| r.abs_diff(e.row) * 1000 + c.abs_diff(e.col)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Row `r` of the unedited screen with every active "everywhere" edit
-/// applied in turn. `None` when none of them is on the line; else the new
-/// cells, the first changed column, the edit that changed it first, and each
-/// pass's (starts, from length, to length) - for mapping columns.
-#[allow(clippy::type_complexity)]
-fn rebuild_line(
-    plain: &Vt,
-    r: usize,
-    active: &[(usize, &TextEdit)],
-    nearest: &[Option<(usize, usize)>],
-) -> Option<(
-    Vec<(char, super::style::TextStyle)>,
-    usize,
-    usize,
-    Vec<(Vec<usize>, usize, usize)>,
-)> {
-    use super::style::TextStyle;
-
-    let mut cells: Vec<(char, TextStyle)> = plain
-        .line(r)
-        .cells()
-        .iter()
-        .filter(|c| c.width() > 0)
-        .map(|c| (c.char(), TextStyle::from_pen(c.pen())))
-        .collect();
-
-    let mut first: Option<(usize, usize)> = None; // (col, edit index)
-    let mut passes = Vec::new();
-
-    for (n, (k, e)) in active.iter().enumerate() {
-        let line: Vec<char> = cells.iter().map(|c| c.0).collect();
-        let mut starts = find_chars(&line, &e.from);
-
-        if let TextMode::Everywhere {
-            occurrences: Occurrences::Nearest,
-            ..
-        } = e.mode
-        {
-            let target = nearest[n].filter(|&(nr, _)| nr == r).map(|(_, c)| c);
-            starts.retain(|&c| Some(c) == target);
-        }
-
-        if starts.is_empty() {
-            continue;
-        }
-
-        let col = starts[0];
-        first = Some(match first {
-            Some((c, k0)) if c <= col => (c, k0),
-            _ => (col, *k),
-        });
-
-        cells = replace_in(&cells, &starts, e);
-        passes.push((starts, e.from.len(), e.to.chars().count()));
-    }
-
-    let (col, k) = first?;
-
-    Some((cells, col, k, passes))
-}
-
-/// Patches for "everywhere" edits on the lines that changed: each line is
-/// rebuilt from the unedited screen `plain`, with every active edit applied
-/// in turn (the rest of the line moving along when lengths differ), and
-/// drawn onto the edited screen `vt`. Returns (edit index, patch) per line.
-fn everywhere_patches(
-    plain: &Vt,
-    vt: &Vt,
-    active: &[(usize, &TextEdit)],
-    changed: &[usize],
-) -> Vec<(usize, String)> {
-    let (cols, rows) = plain.size();
-
-    if active.is_empty() {
-        return Vec::new();
-    }
-
-    let nearest = nearest_targets(plain, active);
-    let mut patches = Vec::new();
-
-    for &r in changed.iter().filter(|&&r| r < rows) {
-        let Some((mut cells, col, k, _)) = rebuild_line(plain, r, active, &nearest) else {
-            continue;
-        };
-
-        cells.resize(cols, (' ', super::style::TextStyle::default()));
-        cells.truncate(cols);
-
-        let (text, styles): (String, Vec<_>) = cells[col..].iter().copied().unzip();
-        patches.push((k, text_patch(vt, r, col, cols - col, &text, &styles)));
-    }
-
-    patches
-}
-
-/// Moves the edited screen's cursor to where the unedited screen's cursor
-/// is, adjusted for "everywhere" changes before it on its line - so what the
-/// recording types next lands after the changed text. `None` if it's
-/// already there, or its line has no such change.
-fn everywhere_cursor(plain: &Vt, vt: &Vt, active: &[(usize, &TextEdit)]) -> Option<String> {
-    let c = plain.cursor();
-    let nearest = nearest_targets(plain, active);
-    let (_, _, _, passes) = rebuild_line(plain, c.row, active, &nearest)?;
-
-    let mut col = c.col;
-
-    for (starts, from, to) in passes {
-        let mut shift: isize = 0;
-
-        for s in starts {
-            if s + from <= col {
-                shift += to as isize - from as isize;
-            } else if s <= col {
-                // inside a changed span: keep it within the new text
-                shift += (to.min(col - s) as isize) - (col - s) as isize;
-            }
-        }
-
-        col = col.saturating_add_signed(shift);
-    }
-
-    let col = col.min(vt.size().0 - 1);
-    let now = vt.cursor();
-
-    ((now.row, now.col) != (c.row, col)).then(|| format!("\x1b[{};{}H", c.row + 1, col + 1))
 }
 
 /// Columns where `from` starts in `line` (non-overlapping).
@@ -1277,6 +1418,12 @@ fn centered(text: &str, (cols, rows): (usize, usize)) -> String {
     out
 }
 
+/// The visible screen's lines. (avt's `text()` is always the main screen,
+/// even while a program like vim is using the alternate one.)
+pub fn screen_text(vt: &Vt) -> Vec<String> {
+    vt.view().map(|l| l.text()).collect()
+}
+
 fn delay_in(times: &[Duration], i: usize) -> Option<Duration> {
     let t = *times.get(i)?;
     let prev = i.checked_sub(1).map_or(Duration::ZERO, |p| times[p]);
@@ -1390,7 +1537,7 @@ mod tests {
     fn screen(vt: &Vt) -> (Vec<String>, usize, usize, (usize, usize)) {
         let c = vt.cursor();
 
-        (vt.text(), c.col, c.row, vt.size())
+        (super::screen_text(vt), c.col, c.row, vt.size())
     }
 
     /// A recording long enough to produce many keyframes, with colors,
@@ -1754,6 +1901,55 @@ mod tests {
             )],
         );
         assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "greetings world!");
+    }
+
+    /// Regression: full-screen programs like vim place every typed character
+    /// with an absolute cursor move, which undid the cursor shift, so typing
+    /// after a lengthened word overwrote it. Edits now follow their text and
+    /// rebuild its line whenever it changes.
+    #[test]
+    fn until_drawn_over_survives_absolute_positioning() {
+        // vim-like: the word, then each key typed after it placed absolutely
+        let mut tl = simple(&[
+            (1, "\x1b[2;1Hmy cookout"),
+            (2, "\x1b[2;11H "),
+            (3, "\x1b[2;12H:"),
+            (4, "\x1b[2;13HD"),
+            (5, "\x1b[2;14H\x1b[?25l\x1b[5;15H1\x1b[2;14H"), // a status line elsewhere
+        ]);
+
+        let edit = Edit::Text {
+            at: 1,
+            row: 1,
+            col: 3,
+            from: "cookout".to_owned(),
+            to: "HOUSEWARMING".to_owned(),
+            mode: TextMode::UntilDrawnOver,
+            styles: Vec::new(),
+        };
+        apply(&mut tl, vec![edit]);
+
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(row(&end, 1), "my HOUSEWARMING :D");
+        assert_eq!(
+            (end.cursor().row, end.cursor().col),
+            (1, 18),
+            "the cursor follows too"
+        );
+
+        // once the word itself is drawn over, the edit ends
+        let mut tl = simple(&[(1, "\x1b[2;1Hmy cookout"), (2, "\x1b[2;4Hparty  ")]);
+        let edit = Edit::Text {
+            at: 1,
+            row: 1,
+            col: 3,
+            from: "cookout".to_owned(),
+            to: "HOUSEWARMING".to_owned(),
+            mode: TextMode::UntilDrawnOver,
+            styles: Vec::new(),
+        };
+        apply(&mut tl, vec![edit]);
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 1), "my party");
     }
 
     /// Regression: an edit that replaces nothing (an insert) used to loop

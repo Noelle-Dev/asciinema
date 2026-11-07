@@ -245,13 +245,11 @@ impl TextEditor {
 
         let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
 
-        let (old, new) = match self.mode {
-            // the whole fixed-width row: the tail's shift is part of the change
-            TextMode::UntilDrawnOver => (&old[..], &new[..]),
-
-            // lengths don't matter: compare without the trailing blanks
-            TextMode::Everywhere { .. } => (trim_blank(&old), trim_blank(&new)),
-        };
+        // Just the text that changed: playback moves the rest of the line
+        // along when the length differs (and an "until drawn over" edit
+        // follows this text, so it mustn't include the rest of the line,
+        // which the recording may go on changing).
+        let (old, new) = (trim_blank(&old), trim_blank(&new));
 
         let prefix = prefix.min(old.len()).min(new.len());
 
@@ -1314,7 +1312,7 @@ mod tests {
         assert_eq!(super::preview_screen(&a).unwrap().text()[0].trim_end(), "$");
 
         key(&mut a, KeyCode::Enter);
-        assert_eq!(change(&a), (2, "ls".to_owned(), String::new()));
+        assert_eq!(change(&a), (1, " ls".to_owned(), String::new()));
         assert_eq!(row(&a, 0), "$");
     }
 
@@ -1328,8 +1326,8 @@ mod tests {
         key(&mut a, KeyCode::Delete);
         key(&mut a, KeyCode::Enter);
 
-        // until drawn over: the change covers the shifted tail
-        assert_eq!(change(&a), (2, "ls".to_owned(), "s".to_owned()));
+        // just the removed letter; playback moves the rest along
+        assert_eq!(change(&a), (2, "l".to_owned(), String::new()));
         assert_eq!(row(&a, 0), "$ s");
     }
 
@@ -1344,7 +1342,7 @@ mod tests {
         key(&mut a, KeyCode::Enter);
 
         assert_eq!(row(&a, 1), "fiXle");
-        assert_eq!(change(&a), (2, "le".to_owned(), "Xle".to_owned()));
+        assert_eq!(change(&a), (2, String::new(), "X".to_owned()));
     }
 
     #[test]

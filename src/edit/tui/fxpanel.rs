@@ -194,7 +194,9 @@ pub fn open(app: &mut App) {
 
     // start from the whole screen when there's something on it
     let screen = app.timeline.vt_at_position(app.position);
-    let has_text = screen.text().iter().any(|l| !l.trim().is_empty());
+    let has_text = crate::edit::timeline::screen_text(&screen)
+        .iter()
+        .any(|l| !l.trim().is_empty());
 
     let source = if has_text {
         FxSource::Screen
