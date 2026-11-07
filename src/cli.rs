@@ -262,10 +262,7 @@ pub enum Commands {
       Rains in the 40x3 region at the screen's third row, before event 30
 
   asciinema edit demo.cast --edit-text '29:hello world=>hi there'
-      Changes \"hello world\" on screen after event 29, until it's drawn over
-
-  asciinema edit demo.cast --edit-text '0:hunter2=>*******' --text-everywhere
-      Hides \"hunter2\" wherever it appears, for the whole recording
+      Changes \"hello world\" on screen after event 29, as if it had been retyped
 
   asciinema edit demo.cast --cursor block
       Plays the recording back with a steady block cursor
@@ -805,7 +802,7 @@ pub struct Edit {
     )]
     pub insert_effect: Option<String>,
 
-    /// Change text on screen from position AT (after AT events): FROM becomes TO, keeping the cells' style. FROM is looked up on the screen at that point (the first occurrence, or the one at ROW,COL, counting from 0). By default the change is drawn once and stays until the recording draws over it; see --text-everywhere. A shorter TO is padded with spaces; a longer one overwrites the cells after FROM.
+    /// Change text on screen from position AT (after AT events): FROM becomes TO, keeping the cells' style. FROM is looked up on the screen at that point (the first occurrence, or the one at ROW,COL, counting from 0). By default it's a one-off change, as if FROM had been deleted and TO typed in at that point: the rest of the line and the cursor move along, and the recording carries on as recorded from there.
     #[arg(
         long,
         value_name = "AT[@ROW,COL]:FROM=>TO",
@@ -813,18 +810,6 @@ pub struct Edit {
         long_help
     )]
     pub edit_text: Option<String>,
-
-    /// Make --edit-text apply wherever FROM appears on screen (surviving repaints and scrolling), from AT to the end or --text-until.
-    #[arg(long, help = "Text edit: wherever the text appears", long_help)]
-    pub text_everywhere: bool,
-
-    /// With --text-everywhere: stop before event N.
-    #[arg(long, value_name = "N", help = "Text edit: until event N", long_help)]
-    pub text_until: Option<usize>,
-
-    /// With --text-everywhere: change only the occurrence nearest ROW,COL (or FROM's first occurrence), not all of them.
-    #[arg(long, help = "Text edit: only the nearest occurrence", long_help)]
-    pub text_nearest: bool,
 
     /// Text colour for --edit-text's new text: a name (red, bright-blue, ...), a palette number 0-255, or #rrggbb.
     #[arg(

@@ -15,7 +15,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use super::app::App;
-use crate::edit::edits::{Occurrences, TextMode};
 use crate::edit::style::{StyleColor, TextStyle, COLOR_NAMES};
 use crate::edit::timeline::{text_patch, Origin};
 use crate::edit::Edit;
@@ -27,9 +26,6 @@ const LABEL_W: usize = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
-    Mode,
-    Until,
-    Occurrences,
     Colour,
     Background,
     Style,
@@ -58,10 +54,6 @@ pub enum PanelMode {
         row: Row,
         selected: usize,
     },
-    /// Typing the end event in place.
-    EditUntil {
-        input: String,
-    },
     /// Typing a #rrggbb colour in place (for the text, or its background).
     EditHex {
         background: bool,
@@ -79,7 +71,6 @@ pub struct TextEditor {
     pub line: Option<LineBuf>,
     /// Other lines changed in this edit, kept while editing elsewhere.
     pub others: Vec<LineBuf>,
-    pub mode: TextMode,
     pub focus: Focus,
     pub row: usize,
     pub panel: PanelMode,
@@ -185,26 +176,7 @@ impl TextEditor {
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        match self.mode {
-            TextMode::UntilDrawnOver => {
-                vec![
-                    Row::Mode,
-                    Row::Colour,
-                    Row::Background,
-                    Row::Style,
-                    Row::Apply,
-                ]
-            }
-            TextMode::Everywhere { .. } => vec![
-                Row::Mode,
-                Row::Until,
-                Row::Occurrences,
-                Row::Colour,
-                Row::Background,
-                Row::Style,
-                Row::Apply,
-            ],
-        }
+        vec![Row::Colour, Row::Background, Row::Style, Row::Apply]
     }
 
     /// Selected columns on the cursor's row (inclusive), if selecting.
@@ -218,10 +190,7 @@ impl TextEditor {
     /// anyway.
     ///
     /// Only the part that changed is kept; when the length changes, the rest
-    /// of the line moves along on playback. For an "until drawn over" edit
-    /// the change runs to where the old and new line agree again at the end
-    /// (so it includes the moved tail); for "wherever it appears" it's just
-    /// the changed text, and each occurrence's own line moves along.
+    /// of the line moves along on playback.
     pub fn change(&self) -> Option<(usize, String, String, Vec<TextStyle>)> {
         self.change_of(self.line.as_ref()?)
     }
@@ -246,9 +215,7 @@ impl TextEditor {
         let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
 
         // Just the text that changed: playback moves the rest of the line
-        // along when the length differs (and an "until drawn over" edit
-        // follows this text, so it mustn't include the rest of the line,
-        // which the recording may go on changing).
+        // along when the length differs, as retyping it would.
         let (old, new) = (trim_blank(&old), trim_blank(&new));
 
         let prefix = prefix.min(old.len()).min(new.len());
@@ -267,12 +234,8 @@ impl TextEditor {
         let old = trim_blank(&old[prefix..old.len() - suffix]);
         let mut new = trim_blank(&new[prefix..new.len() - suffix]);
 
-        let nothing = old.is_empty() && new.is_empty();
-        let everywhere = matches!(self.mode, TextMode::Everywhere { .. });
-
-        // text added after the end of the line replaces nothing (an insert);
-        // a change everywhere needs text to look for
-        if nothing || (old.is_empty() && everywhere) {
+        // (text added after the end of the line replaces nothing: an insert)
+        if old.is_empty() && new.is_empty() {
             return None;
         }
 
@@ -367,7 +330,6 @@ pub fn open(app: &mut App) {
         anchor: None,
         line: None,
         others: Vec::new(),
-        mode: TextMode::UntilDrawnOver,
         focus: Focus::Screen,
         row: 0,
         panel: PanelMode::List,
@@ -379,7 +341,6 @@ pub fn open(app: &mut App) {
 
 fn apply(app: &mut App) {
     let Some(ed) = &app.text else { return };
-    let mode = ed.mode;
     let at = app.insert_position();
 
     // one text edit per changed line, saved (and undone) together
@@ -395,7 +356,6 @@ fn apply(app: &mut App) {
                 col,
                 from,
                 to,
-                mode,
                 styles: crate::edit::style::to_runs(&styles),
             })
         })
@@ -599,30 +559,19 @@ fn screen_key(app: &mut App, key: KeyEvent) {
 /// Choices in a row's dropdown.
 fn choices(row: Row) -> Vec<String> {
     match row {
-        Row::Mode => vec!["Until it's drawn over".into(), "Wherever it appears".into()],
-        Row::Occurrences => vec!["Every one on screen".into(), "The nearest one".into()],
-
         Row::Colour | Row::Background => std::iter::once("The terminal's default".to_owned())
             .chain(COLOR_NAMES.iter().map(|n| n.replace('-', " ")))
             .chain(std::iter::once("Custom #rrggbb…".to_owned()))
             .collect(),
 
         Row::Style => STYLE_CHOICES.iter().map(|s| s.to_string()).collect(),
-        Row::Until | Row::Apply => Vec::new(),
+        Row::Apply => Vec::new(),
     }
 }
 
 /// Where the dropdown starts, given the current setting.
 fn initial_choice(ed: &TextEditor, row: Row) -> usize {
     match row {
-        Row::Mode => usize::from(matches!(ed.mode, TextMode::Everywhere { .. })),
-        Row::Occurrences => usize::from(matches!(
-            ed.mode,
-            TextMode::Everywhere {
-                occurrences: Occurrences::Nearest,
-                ..
-            }
-        )),
         Row::Colour | Row::Background => {
             let style = target_styles(ed).and_then(|s| s.first().copied());
             let c = style.and_then(|s| if row == Row::Colour { s.fg } else { s.bg });
@@ -687,14 +636,6 @@ fn panel_key(app: &mut App, key: KeyEvent) {
             KeyCode::Down | KeyCode::Char('j') => ed.row = (ed.row + 1).min(rows.len() - 1),
 
             KeyCode::Enter => match rows[ed.row.min(rows.len() - 1)] {
-                Row::Until => {
-                    let input = match ed.mode {
-                        TextMode::Everywhere { until: Some(u), .. } => u.to_string(),
-                        _ => String::new(),
-                    };
-                    ed.panel = PanelMode::EditUntil { input };
-                }
-
                 Row::Apply => apply(app),
 
                 row => {
@@ -727,40 +668,6 @@ fn panel_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
         }
-
-        PanelMode::EditUntil { mut input } => match key.code {
-            KeyCode::Esc => ed.panel = PanelMode::List,
-            KeyCode::Backspace => {
-                input.pop();
-                ed.panel = PanelMode::EditUntil { input };
-            }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                input.push(c);
-                ed.panel = PanelMode::EditUntil { input };
-            }
-
-            KeyCode::Enter => {
-                let until = input.parse::<usize>().ok();
-                let at = app.insert_position();
-                let n = app.timeline.original_len();
-
-                if let Some(u) = until.filter(|&u| u < at || u > n) {
-                    return app.error(format!(
-                        "the end must be an event from {at} to {n}, not {u}"
-                    ));
-                }
-
-                let Some(ed) = &mut app.text else { return };
-
-                if let TextMode::Everywhere { until: u, .. } = &mut ed.mode {
-                    *u = until;
-                }
-
-                ed.panel = PanelMode::List;
-            }
-
-            _ => {}
-        },
 
         PanelMode::EditHex {
             background,
@@ -801,29 +708,6 @@ fn choose(app: &mut App, row: Row, choice: usize) {
     ed.panel = PanelMode::List;
 
     match row {
-        Row::Mode => {
-            ed.mode = if choice == 0 {
-                TextMode::UntilDrawnOver
-            } else {
-                TextMode::Everywhere {
-                    until: None,
-                    occurrences: Occurrences::Every,
-                }
-            };
-
-            ed.row = ed.row.min(ed.rows().len() - 1);
-        }
-
-        Row::Occurrences => {
-            if let TextMode::Everywhere { occurrences, .. } = &mut ed.mode {
-                *occurrences = if choice == 0 {
-                    Occurrences::Every
-                } else {
-                    Occurrences::Nearest
-                };
-            }
-        }
-
         Row::Colour | Row::Background => {
             let background = row == Row::Background;
 
@@ -866,7 +750,7 @@ fn choose(app: &mut App, row: Row, choice: usize) {
             });
         }
 
-        Row::Until | Row::Apply => {}
+        Row::Apply => {}
     }
 }
 
@@ -919,43 +803,6 @@ fn row_line(ed: &TextEditor, row: Row) -> Line<'static> {
     let arrow = || Span::styled(" ▾", Style::default().fg(DIM));
 
     match row {
-        Row::Mode => Line::from(vec![
-            label("Lasts"),
-            Span::raw(match ed.mode {
-                TextMode::UntilDrawnOver => "until drawn over",
-                TextMode::Everywhere { .. } => "wherever it appears",
-            }),
-            arrow(),
-        ]),
-
-        Row::Until => {
-            let value = match (&ed.panel, ed.mode) {
-                (PanelMode::EditUntil { input }, _) => Span::styled(
-                    format!(" {input}▏    "),
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Indexed(238))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                (_, TextMode::Everywhere { until: Some(u), .. }) => Span::raw(format!("event {u}")),
-                _ => Span::raw("the end"),
-            };
-
-            Line::from(vec![label("Until"), value])
-        }
-
-        Row::Occurrences => Line::from(vec![
-            label("Occurrences"),
-            Span::raw(match ed.mode {
-                TextMode::Everywhere {
-                    occurrences: Occurrences::Nearest,
-                    ..
-                } => "the nearest one",
-                _ => "every one on screen",
-            }),
-            arrow(),
-        ]),
-
         Row::Colour | Row::Background => {
             let styles = target_styles(ed).unwrap_or_default();
             let picks: Vec<Option<StyleColor>> = styles
@@ -1031,9 +878,6 @@ fn row_line(ed: &TextEditor, row: Row) -> Line<'static> {
 
 fn row_help(row: Row) -> &'static str {
     match row {
-        Row::Mode => "Until drawn over: the change is drawn once and stays - scrolling with the screen - until the recording draws over it. Wherever it appears: the original text is changed every time it shows up, even if a program repaints it.",
-        Row::Until => "Where an everywhere change stops: an event number (see the status bar), or empty for the end of the recording.",
-        Row::Occurrences => "Change every occurrence of the text on screen, or only the one nearest where you edited it.",
         Row::Colour => "The colour of the selected text (or the character under the cursor): the terminal's default, one of the 16 palette colours, or a #rrggbb of your own.",
         Row::Background => "The background behind the selected text (or the character under the cursor).",
         Row::Style => "Turn bold, italic, underline, strikethrough or inverse on or off for the selected text, or put back how it originally looked.",
@@ -1192,9 +1036,6 @@ pub fn hints(ed: &TextEditor) -> &'static [(&'static str, &'static str)] {
         (Focus::Panel, PanelMode::Dropdown { .. }) => {
             &[("↑↓", "choose"), ("enter", "select"), ("esc", "cancel")]
         }
-        (Focus::Panel, PanelMode::EditUntil { .. }) => {
-            &[("0-9", "event"), ("enter", "apply"), ("esc", "cancel")]
-        }
         (Focus::Panel, PanelMode::EditHex { .. }) => {
             &[("#rrggbb", "colour"), ("enter", "apply"), ("esc", "cancel")]
         }
@@ -1205,8 +1046,7 @@ pub fn hints(ed: &TextEditor) -> &'static [(&'static str, &'static str)] {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{handle_key, open, Focus, PanelMode};
-    use crate::edit::edits::{Occurrences, TextMode};
+    use super::{handle_key, open, PanelMode};
     use crate::edit::timeline::Origin;
     use crate::edit::tui::app::tests::app;
     use crate::edit::tui::app::App;
@@ -1246,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn select_and_type_until_drawn_over() {
+    fn select_and_type() {
         let (mut a, _d) = app();
         at_file(&mut a);
 
@@ -1271,7 +1111,6 @@ mod tests {
                 col: 0,
                 from: "file".to_owned(),
                 to: "data".to_owned(),
-                mode: TextMode::UntilDrawnOver,
                 styles: Vec::new(),
             }]
         );
@@ -1411,19 +1250,12 @@ mod tests {
         a.seek_position(4); // row 0 "$ ls", row 1 "file"
         open(&mut a);
 
-        // restyle on row 1 in "wherever it appears" mode, then move up:
-        // the change is kept and the cursor moves freely
-        a.text.as_mut().unwrap().mode = TextMode::Everywhere {
-            until: None,
-            occurrences: Occurrences::Every,
-        };
+        // restyle on row 1, then move up: the change is kept and the cursor
+        // moves freely
         a.text.as_mut().unwrap().cursor = (0, 1);
         shift(&mut a, KeyCode::Right);
         key(&mut a, KeyCode::Tab);
-        for _ in 0..3 {
-            key(&mut a, KeyCode::Down); // Lasts, Until, Occurrences -> Colour
-        }
-        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Enter); // Colour
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // red
         key(&mut a, KeyCode::Enter);
@@ -1461,76 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn everywhere_from_the_panel() {
-        let (mut a, _d) = app();
-        a.seek_position(4);
-        open(&mut a);
-        a.text.as_mut().unwrap().cursor = (2, 0);
-
-        shift(&mut a, KeyCode::Right);
-        typed(&mut a, "LS");
-
-        // Tab to the panel: mode -> wherever it appears, nearest
-        key(&mut a, KeyCode::Tab);
-        key(&mut a, KeyCode::Enter);
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Enter);
-        assert_eq!(a.text.as_ref().unwrap().rows().len(), 7);
-
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Down); // occurrences
-        key(&mut a, KeyCode::Enter);
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Enter);
-
-        // until event 5
-        key(&mut a, KeyCode::Up);
-        key(&mut a, KeyCode::Enter);
-        assert!(matches!(
-            a.text.as_ref().unwrap().panel,
-            PanelMode::EditUntil { .. }
-        ));
-        typed(&mut a, "5");
-        key(&mut a, KeyCode::Enter);
-
-        key(&mut a, KeyCode::Tab);
-        assert_eq!(a.text.as_ref().unwrap().focus, Focus::Screen);
-        key(&mut a, KeyCode::Enter);
-
-        let [Edit::Text { from, to, mode, .. }] = &a.edits.edits[..] else {
-            panic!("{:?}", a.edits.edits);
-        };
-        assert_eq!((from.as_str(), to.as_str()), ("ls", "LS"));
-        assert_eq!(
-            *mode,
-            TextMode::Everywhere {
-                until: Some(5),
-                occurrences: Occurrences::Nearest,
-            }
-        );
-    }
-
-    #[test]
-    fn everywhere_changes_are_just_the_changed_text() {
-        let (mut a, _d) = app();
-        at_file(&mut a); // "file"
-
-        // delete the "i": an until-drawn-over edit would carry the tail,
-        // an everywhere one is just the word that changed
-        a.text.as_mut().unwrap().cursor = (1, 1);
-        key(&mut a, KeyCode::Delete);
-        a.text.as_mut().unwrap().mode = TextMode::Everywhere {
-            until: None,
-            occurrences: Occurrences::Every,
-        };
-
-        assert_eq!(
-            a.text.as_ref().unwrap().change(),
-            Some((1, "i".to_owned(), String::new(), Vec::new()))
-        );
-    }
-
-    #[test]
     fn esc_cancels() {
         let (mut a, _d) = app();
         at_file(&mut a);
@@ -1552,8 +1314,7 @@ mod tests {
         // select "fi", then Tab to the panel: Colour -> red
         shift(&mut a, KeyCode::Right);
         key(&mut a, KeyCode::Tab);
-        key(&mut a, KeyCode::Down); // Colour
-        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Enter); // Colour
         assert!(matches!(
             a.text.as_ref().unwrap().panel,
             PanelMode::Dropdown { selected: 0, .. }

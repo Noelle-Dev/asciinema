@@ -6,7 +6,6 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::asciicast::{self, CursorShape, EventData};
 use crate::cli;
-use crate::edit::edits::{Occurrences, TextMode};
 use crate::edit::timeline::Origin;
 use crate::edit::{fx, render, tui, Clip, Edit, EditList, Timeline};
 use crate::status;
@@ -268,11 +267,9 @@ impl cli::Edit {
                 (r, c)
             }
 
-            // "everywhere" finds the text whenever it shows up; it needn't be there yet
-            None => match (found, self.text_everywhere) {
-                (Some(spot), _) => spot,
-                (None, true) => (0, 0),
-                (None, false) => bail!(
+            None => match found {
+                Some(spot) => spot,
+                None => bail!(
                     "\"{from}\" isn't on the screen at {at}; give its position with AT@ROW,COL"
                 ),
             },
@@ -309,23 +306,6 @@ impl cli::Edit {
         new_style.italic |= self.text_italic;
         new_style.underline |= self.text_underline;
 
-        let mode = if self.text_everywhere {
-            TextMode::Everywhere {
-                until: self.text_until,
-                occurrences: if self.text_nearest {
-                    Occurrences::Nearest
-                } else {
-                    Occurrences::Every
-                },
-            }
-        } else {
-            if self.text_until.is_some() || self.text_nearest {
-                bail!("--text-until and --text-nearest need --text-everywhere");
-            }
-
-            TextMode::UntilDrawnOver
-        };
-
         // just the changed text: playback moves the rest of the line along
         let styles = if restyled {
             crate::edit::style::to_runs(&vec![new_style; to.chars().count()])
@@ -341,7 +321,6 @@ impl cli::Edit {
             col,
             from,
             to,
-            mode,
             styles,
         })
     }
@@ -614,26 +593,11 @@ pub(crate) fn describe(edit: &Edit) -> String {
             col,
             ref from,
             ref to,
-            mode,
             ref styles,
         } => {
-            let how = match mode {
-                TextMode::UntilDrawnOver => "until drawn over".to_owned(),
-                TextMode::Everywhere { until, occurrences } => format!(
-                    "wherever it appears{}{}",
-                    match occurrences {
-                        Occurrences::Every => "",
-                        Occurrences::Nearest => " (nearest only)",
-                    },
-                    until.map_or(String::new(), |u| format!(" until {u}"))
-                ),
-            };
-
             let restyled = if styles.is_empty() { "" } else { ", restyled" };
 
-            format!(
-                "change \"{from}\" to \"{to}\" at row {row}, col {col} from {at}, {how}{restyled}"
-            )
+            format!("change \"{from}\" to \"{to}\" at row {row}, col {col} at {at}{restyled}")
         }
     }
 }
@@ -910,9 +874,6 @@ mod tests {
             duplicate: vec![],
             insert_effect: None,
             edit_text: None,
-            text_everywhere: false,
-            text_until: None,
-            text_nearest: false,
             text_fg: None,
             text_bg: None,
             text_bold: false,
@@ -1005,15 +966,14 @@ mod tests {
         .unwrap();
         let input_s = input.to_string_lossy().into_owned();
 
-        // until drawn over: found on the screen at that point
+        // once: found on the screen at that point
         let mut cmd = edit_cmd(&input_s);
         cmd.edit_text = Some("2:file=>data".to_owned());
         cmd.run().unwrap();
 
-        // everywhere
+        // the prompt after it, which gets longer: the cursor moves along
         let mut cmd = edit_cmd(&input_s);
-        cmd.edit_text = Some("0:user=>me".to_owned()); // not on screen yet: fine
-        cmd.text_everywhere = true;
+        cmd.edit_text = Some("3@2,0:user=>me".to_owned());
         cmd.render = Some(output.to_string_lossy().into_owned());
         cmd.run().unwrap();
 
@@ -1024,16 +984,12 @@ mod tests {
             .iter()
             .map(|l| l.trim_end().to_owned())
             .collect();
-        assert_eq!(end[..3], ["me$ ls", "data", "me$"]);
+        assert_eq!(end[..3], ["user$ ls", "data", "me$"]);
+        assert_eq!(tl.vt_at_position(tl.len()).cursor().col, 4);
 
-        // text that isn't there is an error; options need --text-everywhere
+        // text that isn't there is an error
         let mut cmd = edit_cmd(&input_s);
         cmd.edit_text = Some("1:nope=>x".to_owned());
-        assert!(cmd.run().is_err());
-
-        let mut cmd = edit_cmd(&input_s);
-        cmd.edit_text = Some("1:user=>x".to_owned());
-        cmd.text_nearest = true;
         assert!(cmd.run().is_err());
     }
 
