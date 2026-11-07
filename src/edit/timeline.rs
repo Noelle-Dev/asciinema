@@ -1128,39 +1128,55 @@ fn find_chars(line: &[char], from: &[char]) -> Vec<usize> {
     found
 }
 
-/// `cells` with `e.from` at each of `starts` replaced by `e.to`. New text
-/// takes the edit's styles, or those of the cells it replaces; the rest of
-/// the line keeps its own.
+/// `cells` with `e.from` at each of `starts` replaced by `e.to` (with an
+/// empty `e.from`, `e.to` is inserted there). New text takes the edit's
+/// styles, or those of the cells it replaces (inserted text: of the cell
+/// before it); the rest of the line keeps its own.
 fn replace_in(
     cells: &[(char, super::style::TextStyle)],
     starts: &[usize],
     e: &TextEdit,
 ) -> Vec<(char, super::style::TextStyle)> {
-    use super::style::TextStyle;
-
     let to: Vec<char> = e.to.chars().collect();
-    let mut out = Vec::with_capacity(cells.len());
+    let width = e.from.len();
+    let mut starts: Vec<usize> = starts.to_vec();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut starts = starts.into_iter().peekable();
+
+    let mut out = Vec::with_capacity(cells.len() + to.len());
     let mut i = 0;
 
-    while i < cells.len() {
-        if starts.contains(&i) {
-            let replaced = &cells[i..(i + e.from.len()).min(cells.len())];
+    // `i` only ever moves forward and each start is used once, so this ends
+    // even when nothing is replaced (an insert)
+    while i <= cells.len() {
+        if starts.peek() == Some(&i) {
+            starts.next();
+
+            let replaced = &cells[i..(i + width).min(cells.len())];
+            let before = i.checked_sub(1).and_then(|p| cells.get(p)).map(|c| c.1);
 
             for (k, ch) in to.iter().enumerate() {
                 let style = e.styles.get(k).copied().unwrap_or_else(|| {
                     replaced
                         .get(k.min(replaced.len().saturating_sub(1)))
-                        .map_or_else(TextStyle::default, |c| c.1)
+                        .map(|c| c.1)
+                        .or(before)
+                        .unwrap_or_default()
                 });
 
                 out.push((*ch, style));
             }
 
-            i += e.from.len();
-        } else {
-            out.push(cells[i]);
-            i += 1;
+            if width > 0 {
+                i += width;
+                continue;
+            }
         }
+
+        let Some(cell) = cells.get(i) else { break };
+        out.push(*cell);
+        i += 1;
     }
 
     out
@@ -1706,6 +1722,40 @@ mod tests {
             )],
         );
         assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "greetings world!");
+    }
+
+    /// Regression: an edit that replaces nothing (an insert) used to loop
+    /// forever, eating memory, while rebuilding the line.
+    #[test]
+    fn inserting_replaces_nothing_and_ends() {
+        let insert = |col: usize, to: &str| Edit::Text {
+            at: 1,
+            row: 0,
+            col,
+            from: String::new(),
+            to: to.to_owned(),
+            mode: TextMode::UntilDrawnOver,
+            styles: Vec::new(),
+        };
+
+        let mut tl = simple(&[(1, "abcd")]);
+        apply(&mut tl, vec![insert(2, "XY")]);
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "abXYcd");
+
+        // at the end of the text, and at the last column
+        let mut tl = simple(&[(1, "abcd")]);
+        apply(&mut tl, vec![insert(4, "!")]);
+        assert_eq!(row(&tl.vt_at_position(tl.len()), 0), "abcd!");
+
+        let mut tl = simple(&[(1, "abcd")]);
+        apply(&mut tl, vec![insert(19, "z")]);
+        let end = tl.vt_at_position(tl.len());
+        assert_eq!(
+            end.text()[0].chars().count(),
+            20,
+            "the line stays the screen's width"
+        );
+        assert!(end.text()[0].ends_with('z'));
     }
 
     #[test]
