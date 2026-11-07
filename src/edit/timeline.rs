@@ -368,6 +368,13 @@ impl Timeline {
     }
 
     /// Playlist events with their edited times.
+    /// Whether edits add drawing of their own (cuts, clips, effects, text
+    /// edits). Those draw at fixed screen positions, so they only line up
+    /// when playback starts on a cleared screen.
+    pub fn draws_edits(&self) -> bool {
+        !self.structure.is_empty()
+    }
+
     pub fn edited_events(&self) -> impl Iterator<Item = Event> + '_ {
         (0..self.items.len()).map(|i| Event {
             time: self.times[i],
@@ -869,20 +876,45 @@ pub fn text_patch(
 
     // save cursor and pen; origin mode off so the position is absolute
     let mut out = format!("\x1b7\x1b[?6l\x1b[{};{}H", row + 1, col + 1);
-    let mut pen: Option<super::style::TextStyle> = None;
-
-    for i in 0..n {
+    let cell = |i: usize| {
         let style = styles.get(i).copied().unwrap_or_else(|| {
             let cell_pen = cells.get(col + i).map(|c| *c.pen()).unwrap_or_default();
             super::style::TextStyle::from_pen(&cell_pen)
         });
+
+        (to.get(i).copied().unwrap_or(' '), style)
+    };
+
+    // A patch that runs to the end of the line ends in erase-to-end-of-line
+    // rather than trailing blanks: a narrower terminal would wrap those onto
+    // the next line, and it's much less output.
+    let blank = |i: usize| {
+        let (ch, st) = cell(i);
+        ch == ' ' && st == super::style::TextStyle::default()
+    };
+
+    let to_eol = col + n == cols;
+    let end = if to_eol {
+        (0..n).rposition(|i| !blank(i)).map_or(0, |i| i + 1)
+    } else {
+        n
+    };
+
+    let mut pen: Option<super::style::TextStyle> = None;
+
+    for i in 0..end {
+        let (ch, style) = cell(i);
 
         if pen != Some(style) {
             out.push_str(&style.sgr());
             pen = Some(style);
         }
 
-        out.push(to.get(i).copied().unwrap_or(' '));
+        out.push(ch);
+    }
+
+    if to_eol && end < n {
+        out.push_str("\x1b[0m\x1b[K");
     }
 
     // restores the cursor, pen and origin mode

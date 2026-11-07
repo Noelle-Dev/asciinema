@@ -7,16 +7,32 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::Timeline;
-use crate::asciicast::{self, Asciicast, Version};
+use crate::asciicast::{self, Asciicast, Event, EventData, Version};
 use crate::encoder::{AsciicastV3Encoder, EncoderExt};
 use crate::output_writer;
+use std::time::Duration;
+
+/// Clears the screen, cursor home.
+const CLEAR: &str = "\x1b[H\x1b[2J";
 
 /// Encodes the timeline (with edited times) as asciicast v3.
+///
+/// What edits draw (effects, text edits, the screen after a cut or a clip)
+/// is positioned on the screen from its top-left corner. So when there's any,
+/// the recording starts by clearing the screen: it then lines up in every
+/// player, including `asciinema play` without `--clear`.
 pub fn write<W: Write + ?Sized>(timeline: &Timeline, writer: &mut W) -> Result<()> {
+    let already_clears = timeline
+        .event(0)
+        .is_some_and(|(_, d)| matches!(d, EventData::Output(s) if s.starts_with(CLEAR)));
+
+    let clear = (timeline.draws_edits() && !already_clears)
+        .then(|| Event::output(Duration::ZERO, CLEAR.to_owned()));
+
     let cast = Asciicast {
         version: Version::Three,
         header: timeline.header.clone(),
-        events: Box::new(timeline.edited_events().map(Ok)),
+        events: Box::new(clear.into_iter().chain(timeline.edited_events()).map(Ok)),
     };
 
     AsciicastV3Encoder::new(false).encode_to_writer(cast, writer)
@@ -221,5 +237,67 @@ mod tests {
         render_to_path(&tl, &src, &out, false).unwrap();
         assert!(render_to_path(&tl, &src, &out, false).is_err());
         render_to_path(&tl, &src, &out, true).unwrap();
+    }
+
+    #[test]
+    fn edits_that_draw_start_on_a_cleared_screen() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("demo.cast");
+        fs::copy("tests/casts/full-v2.cast", &src).unwrap();
+
+        let first_output = |path: &std::path::Path| {
+            asciicast::open_from_path(path)
+                .unwrap()
+                .events
+                .map(|e| e.unwrap())
+                .find_map(|e| match e.data {
+                    crate::asciicast::EventData::Output(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        // retiming only: unchanged
+        let mut tl = load(&src);
+        let mut edits = EditList::new(tl.len());
+        edits
+            .push(Edit::CapIdle {
+                from: 0,
+                to: 4,
+                max: 1.0,
+            })
+            .unwrap();
+        tl.apply_edits(&edits).unwrap();
+        let out = dir.path().join("retimed.cast");
+        render_to_path(&tl, &src, &out, false).unwrap();
+        assert_eq!(first_output(&out), "ż");
+
+        // a cut: starts by clearing
+        edits.push(Edit::Delete { from: 1, to: 1 }).unwrap();
+        tl.apply_edits(&edits).unwrap();
+        let sidecar = EditList::sidecar_path(&src);
+        edits.save(&sidecar).unwrap();
+        render_in_place(&tl, &src, &sidecar).unwrap();
+        assert_eq!(first_output(&src), "\x1b[H\x1b[2J");
+        let n = times(&src).len();
+
+        // editing and rendering it again doesn't add another clear
+        let mut tl = load(&src);
+        let mut edits = EditList::new(tl.len());
+        edits
+            .push(Edit::Delete {
+                from: n - 1,
+                to: n - 1,
+            })
+            .unwrap();
+        tl.apply_edits(&edits).unwrap();
+        render_in_place(&tl, &src, &sidecar).unwrap();
+
+        let clears = asciicast::open_from_path(&src)
+            .unwrap()
+            .events
+            .filter(|e| matches!(&e.as_ref().unwrap().data, crate::asciicast::EventData::Output(s) if s == "\x1b[H\x1b[2J"))
+            .count();
+        assert_eq!(clears, 1);
     }
 }
