@@ -11,12 +11,31 @@ use crate::encoder::{
 };
 use crate::output_writer::{self, OutputWriter};
 use crate::util;
+use crate::video;
 
 impl cli::Convert {
     pub fn run(self) -> Result<()> {
         let input_path = self.get_input_path()?;
         let output_path = self.get_output_path();
         let cast = asciicast::open_from_path(input_path.as_ref().as_ref())?;
+
+        if self.is_video() {
+            if self.output == "-" {
+                bail!(
+                    "a video can't be written to standard output; give a file name ending in .mp4"
+                );
+            }
+
+            self.get_mode(&output_path)?;
+            let options = video::Options {
+                font_size: self.font_size,
+                font: self.font.clone(),
+                fps: self.fps,
+            };
+
+            return video::render(cast, Path::new(&output_path), &options);
+        }
+
         let mut encoder = self.get_encoder();
         let mut writer = self.open_output_writer(output_path)?;
 
@@ -24,6 +43,11 @@ impl cli::Convert {
         writer.finish()?;
 
         Ok(())
+    }
+
+    /// An .mp4 output (unless a format is given) makes a video.
+    fn is_video(&self) -> bool {
+        self.output_format.is_none() && self.output.to_lowercase().ends_with(".mp4")
     }
 
     fn get_encoder(&self) -> Box<dyn encoder::Encoder> {
@@ -149,6 +173,9 @@ mod tests {
             output: output.as_ref().to_string_lossy().into_owned(),
             output_format: None,
             overwrite: false,
+            font_size: 24.0,
+            font: None,
+            fps: 30,
         }
         .run()
         .unwrap();

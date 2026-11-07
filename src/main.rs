@@ -23,6 +23,7 @@ mod status;
 mod stream;
 mod tty;
 mod util;
+mod video;
 
 use std::process::{ExitCode, Termination};
 

@@ -675,7 +675,7 @@ pub struct Convert {
     /// The output path for the converted recording. Can be a file path or '-' to write to standard output. A .zst suffix enables zstd compression.
     pub output: String,
 
-    /// Specify the format for the converted recording. The default is asciicast-v3. If the output file path ends with .txt, the txt format will be selected automatically unless this option is explicitly specified.
+    /// Specify the format for the converted recording. The default is asciicast-v3. If the output file path ends with .txt, the txt format will be selected automatically unless this option is explicitly specified. An output path ending with .mp4 makes a video of the recording as it plays (this needs ffmpeg); see --font-size, --font and --fps.
     #[arg(
         short = 'f',
         long,
@@ -693,6 +693,30 @@ pub struct Convert {
         long_help
     )]
     pub overwrite: bool,
+
+    /// For an MP4 video: the font size in pixels. The video is as large as the terminal at this size: a 52x26 recording at 24 makes a video about 780x700.
+    #[arg(
+        long,
+        value_name = "PIXELS",
+        default_value_t = 24.0,
+        help = "Video: font size in pixels",
+        long_help
+    )]
+    pub font_size: f32,
+
+    /// For an MP4 video: a monospace font file (.ttf or .otf). By default, the system's monospace font (found with fontconfig).
+    #[arg(long, value_name = "PATH", help = "Video: font file", long_help)]
+    pub font: Option<PathBuf>,
+
+    /// For an MP4 video: frames per second.
+    #[arg(
+        long,
+        value_name = "FPS",
+        default_value_t = 30,
+        help = "Video: frames per second",
+        long_help
+    )]
+    pub fps: u32,
 }
 
 #[derive(Debug, Args)]
