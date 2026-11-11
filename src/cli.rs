@@ -694,6 +694,20 @@ pub struct Convert {
     )]
     pub overwrite: bool,
 
+    /// Write the same screens in fewer bytes: the recording is replayed and, after each event, only what changed on screen is written (changed cells, scrolls, the cursor); events that change nothing visible are dropped, and the screen is drawn at most --compact-fps times a second. For asciicast output.
+    #[arg(long, help = "Rewrite the output to be smaller", long_help)]
+    pub compact: bool,
+
+    /// With --compact: draw the screen at most this many times a second (screens shown for less than a frame are skipped). 0 keeps every screen.
+    #[arg(
+        long,
+        value_name = "FPS",
+        default_value_t = 60,
+        help = "With --compact: frames per second at most",
+        long_help
+    )]
+    pub compact_fps: u32,
+
     /// For an MP4 video: the font size in pixels. The video is as large as the terminal at this size: a 52x26 recording at 24 makes a video about 780x700.
     #[arg(
         long,

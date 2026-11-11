@@ -3,6 +3,7 @@ mod api;
 mod asciicast;
 mod cli;
 mod cmd;
+mod compact;
 mod config;
 mod edit;
 mod encoder;

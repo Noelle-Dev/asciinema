@@ -39,6 +39,25 @@ impl cli::Convert {
         let mut encoder = self.get_encoder();
         let mut writer = self.open_output_writer(output_path)?;
 
+        let cast = if self.compact {
+            let size = (
+                cast.header.term_cols as usize,
+                cast.header.term_rows as usize,
+            );
+            let events = cast.events.collect::<Result<Vec<_>>>()?;
+
+            let fps = (self.compact_fps > 0).then_some(self.compact_fps);
+            let events = crate::compact::compact(size, &events, fps);
+
+            asciicast::Asciicast {
+                version: cast.version,
+                header: cast.header,
+                events: Box::new(events.into_iter().map(Ok)),
+            }
+        } else {
+            cast
+        };
+
         encoder.encode_to_writer(cast, writer.as_mut())?;
         writer.finish()?;
 
@@ -173,6 +192,8 @@ mod tests {
             output: output.as_ref().to_string_lossy().into_owned(),
             output_format: None,
             overwrite: false,
+            compact: false,
+            compact_fps: 60,
             font_size: 24.0,
             font: None,
             fps: 30,
