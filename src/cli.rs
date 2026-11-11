@@ -817,6 +817,118 @@ pub struct Edit {
     )]
     pub insert_cast: Vec<String>,
 
+    /// Play another recording on top of this one from position AT (after AT events), while this one keeps playing underneath: all of it, or just events FROM..TO. Omit PATH (AT=@FROM..TO) to use events of this recording. Spaces in the track are see-through. Later tracks are drawn on top of earlier ones. See --track-offset, --track-crop and --track-until.
+    #[arg(
+        long,
+        value_name = "AT=[PATH][@FROM..TO]",
+        help = "Play a recording on top",
+        long_help
+    )]
+    pub add_track: Vec<String>,
+
+    /// Where --add-track puts the track's top-left corner on the screen (counting from 0; may be negative). Whatever ends up off screen is cut off.
+    #[arg(
+        long,
+        value_name = "ROW,COL",
+        allow_hyphen_values = true,
+        help = "Track: position on screen",
+        long_help
+    )]
+    pub track_offset: Option<String>,
+
+    /// Show only part of an --add-track track's screen: COLS columns by ROWS rows from ROW, COL.
+    #[arg(
+        long,
+        value_name = "COL,ROW,COLSxROWS",
+        help = "Track: show only part of it",
+        long_help
+    )]
+    pub track_crop: Option<String>,
+
+    /// Keep an --add-track track's last screen up until position UNTIL of this recording, instead of it disappearing when it ends.
+    #[arg(
+        long,
+        value_name = "UNTIL",
+        help = "Track: hold its last screen until",
+        long_help
+    )]
+    pub track_until: Option<String>,
+
+    /// Show a caption over the recording from position AT for SECS seconds, while it keeps playing. \n in TEXT starts a new line. It sits at the bottom centre unless --track-anchor says otherwise (--track-offset moves it from there); --track-fg, --track-bg and --track-bold... style it. With a background colour the whole box covers what's under it.
+    #[arg(
+        long,
+        value_name = "AT=SECS:TEXT",
+        help = "Show a caption over the recording",
+        long_help
+    )]
+    pub add_caption: Vec<String>,
+
+    /// Cover part of the screen from position AT for SECS seconds, COLS columns by ROWS rows from COL, ROW (counting from 0): to hide a password, an email address... Filled with █ in the default colour, or --track-fg's; --track-fill picks another character.
+    #[arg(
+        long,
+        value_name = "AT=SECS:COL,ROW,COLSxROWS",
+        help = "Cover part of the screen",
+        long_help
+    )]
+    pub add_box: Vec<String>,
+
+    /// Restyle part of the screen from position AT for SECS seconds, COLS columns by ROWS rows from COL, ROW (counting from 0), with --track-fg, --track-bg, --track-bold... (inverted if none is given). What's there still shows.
+    #[arg(
+        long,
+        value_name = "AT=SECS:COL,ROW,COLSxROWS",
+        help = "Highlight part of the screen",
+        long_help
+    )]
+    pub add_highlight: Vec<String>,
+
+    /// Where --add-caption's caption sits: nw, n, ne, w, c, e, sw, s or se (top left ... bottom right).
+    #[arg(
+        long,
+        value_name = "WHERE",
+        default_value = "s",
+        help = "Track: where a caption sits",
+        long_help
+    )]
+    pub track_anchor: String,
+
+    /// Text colour of a caption, colour of a box, or a highlight's text colour: a name (red, bright-blue, ...), a palette number 0-255, or #rrggbb.
+    #[arg(long, value_name = "COLOUR", help = "Track: colour", long_help)]
+    pub track_fg: Option<String>,
+
+    /// Background colour of a caption (its whole box then covers what's under it) or of a highlight.
+    #[arg(
+        long,
+        value_name = "COLOUR",
+        help = "Track: background colour",
+        long_help
+    )]
+    pub track_bg: Option<String>,
+
+    /// Bold caption text, or a highlight that makes text bold.
+    #[arg(long, help = "Track: bold", long_help)]
+    pub track_bold: bool,
+
+    /// Italic caption text, or a highlight that makes text italic.
+    #[arg(long, help = "Track: italic", long_help)]
+    pub track_italic: bool,
+
+    /// Underlined caption text, or a highlight that underlines text.
+    #[arg(long, help = "Track: underline", long_help)]
+    pub track_underline: bool,
+
+    /// Inverted caption colours, or a highlight that inverts them.
+    #[arg(long, help = "Track: inverse", long_help)]
+    pub track_inverse: bool,
+
+    /// The character an --add-box box is filled with (default █).
+    #[arg(
+        long,
+        value_name = "CHAR",
+        help = "Track: box fill character",
+        long_help
+    )]
+    pub track_fill: Option<char>,
+
     /// Insert a text effect before event AT, captured with ttfx or tte (whichever is installed; ASCIINEMA_FX_TOOL can name one). Animate typed text (--fx-text), part of the screen (--fx-region) or the whole screen (--fx-screen). See --fx-list for effects and --fx-options for an effect's options.
     #[arg(
         long,

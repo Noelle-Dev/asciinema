@@ -6,8 +6,9 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::asciicast::{self, CursorShape, EventData};
 use crate::cli;
+use crate::edit::edits::{Offset, Rect};
 use crate::edit::timeline::Origin;
-use crate::edit::{fx, render, tui, Clip, Edit, EditList, Timeline};
+use crate::edit::{fx, render, tui, Clip, Edit, EditList, Timeline, Track, TrackSource};
 use crate::status;
 
 impl cli::Edit {
@@ -165,6 +166,18 @@ impl cli::Edit {
             }))
             .chain(self.insert_text.iter().map(|s| parse_insert_text(s, n)))
             .chain(self.insert_cast.iter().map(|s| parse_insert_cast(s, n)))
+            .chain(self.add_track.iter().map(|s| self.parse_track(s, n)))
+            .chain(self.add_caption.iter().map(|s| self.parse_caption(s, n)))
+            .chain(
+                self.add_box
+                    .iter()
+                    .map(|s| self.parse_area_track(s, n, false)),
+            )
+            .chain(
+                self.add_highlight
+                    .iter()
+                    .map(|s| self.parse_area_track(s, n, true)),
+            )
             .chain(self.duplicate.iter().map(|s| {
                 parse_range(s, n).map(|(from, to)| Edit::Insert {
                     at: to + 1,
@@ -189,6 +202,185 @@ impl cli::Edit {
         }
 
         Ok(changed)
+    }
+
+    /// An --add-track edit, with the --track-* options.
+    fn parse_track(&self, s: &str, n: usize) -> Result<Edit> {
+        let Edit::Insert {
+            at,
+            clip: Clip::Recording { path, from, to },
+        } = parse_insert_cast(s, n)
+            .map_err(|_| anyhow!("invalid --add-track '{s}', expected AT=[PATH][@FROM..TO]"))?
+        else {
+            unreachable!("parse_insert_cast makes recording inserts");
+        };
+
+        self.track(
+            at,
+            TrackSource::Recording {
+                path: path.filter(|p| !p.is_empty()),
+                from,
+                to,
+            },
+            n,
+        )
+    }
+
+    /// An --add-caption edit: `AT=SECS:TEXT`.
+    fn parse_caption(&self, s: &str, n: usize) -> Result<Edit> {
+        let (head, text) = s
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid --add-caption '{s}', expected AT=SECS:TEXT"))?;
+
+        let (at, secs) = parse_at_secs(head, n)?;
+        let anchor = fx::Anchor::from_flag(&self.track_anchor).ok_or_else(|| {
+            anyhow!(
+                "invalid --track-anchor '{}', expected nw, n, ne, w, c, e, sw, s or se",
+                self.track_anchor
+            )
+        })?;
+
+        self.track(
+            at,
+            TrackSource::Caption {
+                text: text.replace("\\n", "\n"),
+                secs,
+                anchor,
+                style: self.track_style()?,
+            },
+            n,
+        )
+    }
+
+    /// An --add-box or --add-highlight edit: `AT=SECS:COL,ROW,COLSxROWS`.
+    fn parse_area_track(&self, s: &str, n: usize, highlight: bool) -> Result<Edit> {
+        let flag = if highlight {
+            "--add-highlight"
+        } else {
+            "--add-box"
+        };
+        let (head, area) = s
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid {flag} '{s}', expected AT=SECS:COL,ROW,COLSxROWS"))?;
+
+        let (at, secs) = parse_at_secs(head, n)?;
+        let fx::FxSource::Region {
+            col,
+            row,
+            cols,
+            rows,
+        } = parse_region(area)?
+        else {
+            unreachable!("parse_region makes regions");
+        };
+
+        let source = if highlight {
+            let mut style = self.track_style()?;
+
+            // nothing asked for: invert it
+            if style == crate::edit::style::TextStyle::default() {
+                style.inverse = true;
+            }
+
+            TrackSource::Highlight {
+                cols,
+                rows,
+                secs,
+                style,
+            }
+        } else {
+            TrackSource::Box {
+                cols,
+                rows,
+                secs,
+                fill: self.track_fill.unwrap_or('█'),
+                color: self
+                    .track_fg
+                    .as_deref()
+                    .map(crate::edit::style::StyleColor::parse)
+                    .transpose()?,
+            }
+        };
+
+        let Edit::Track { at, mut track } = self.track(at, source, n)? else {
+            unreachable!("track makes tracks");
+        };
+
+        // the area's place, moved by any --track-offset
+        track.offset.row += row as isize;
+        track.offset.col += col as isize;
+
+        Ok(Edit::Track { at, track })
+    }
+
+    /// The style --track-fg, --track-bg, --track-bold... ask for.
+    fn track_style(&self) -> Result<crate::edit::style::TextStyle> {
+        use crate::edit::style::StyleColor;
+
+        let color = |c: &Option<String>| c.as_deref().map(StyleColor::parse).transpose();
+
+        Ok(crate::edit::style::TextStyle {
+            fg: color(&self.track_fg)?,
+            bg: color(&self.track_bg)?,
+            bold: self.track_bold,
+            italic: self.track_italic,
+            underline: self.track_underline,
+            inverse: self.track_inverse,
+            ..Default::default()
+        })
+    }
+
+    /// A track edit of `source` at `at`, with --track-offset, --track-crop
+    /// and --track-until.
+    fn track(&self, at: usize, source: TrackSource, n: usize) -> Result<Edit> {
+        let offset = match &self.track_offset {
+            Some(o) => {
+                let err = || anyhow!("invalid --track-offset '{o}', expected ROW,COL");
+                let (r, c) = o.split_once(',').ok_or_else(err)?;
+
+                Offset {
+                    row: r.trim().parse().map_err(|_| err())?,
+                    col: c.trim().parse().map_err(|_| err())?,
+                }
+            }
+
+            None => Offset::default(),
+        };
+
+        let crop = match &self.track_crop {
+            Some(c) => match parse_region(c)? {
+                fx::FxSource::Region {
+                    col,
+                    row,
+                    cols,
+                    rows,
+                } => Some(Rect {
+                    row,
+                    col,
+                    rows,
+                    cols,
+                }),
+                _ => unreachable!("parse_region makes regions"),
+            },
+
+            None => None,
+        };
+
+        let until = self
+            .track_until
+            .as_deref()
+            .map(|u| parse_at(u, n))
+            .transpose()?;
+
+        Ok(Edit::Track {
+            at,
+            track: Track {
+                source,
+                offset,
+                crop,
+                until,
+            },
+        })
     }
 
     fn print_fx_help(&self) -> Result<()> {
@@ -469,6 +661,7 @@ fn print_events(timeline: &Timeline) -> Result<()> {
             ),
             Some(Origin::Clip { insert }) => (format!("+clip{insert}"), String::new()),
             Some(Origin::TextEdit { edit }) => (format!("✎text{edit}"), String::new()),
+            Some(Origin::Track { track }) => (format!("▤track{track}"), String::new()),
             None => (String::new(), String::new()),
         };
 
@@ -598,6 +791,34 @@ pub(crate) fn describe(edit: &Edit) -> String {
             let restyled = if styles.is_empty() { "" } else { ", restyled" };
 
             format!("change \"{from}\" to \"{to}\" at row {row}, col {col} at {at}{restyled}")
+        }
+        Edit::Track { at, ref track } => {
+            let mut s = match track.source {
+                crate::edit::TrackSource::Recording { .. } => {
+                    format!("play {} on top from {at}", track.source.describe())
+                }
+                _ => format!("show {} from {at}", track.source.describe()),
+            };
+
+            if track.offset.row != 0 || track.offset.col != 0 {
+                s.push_str(&format!(
+                    ", at row {}, col {}",
+                    track.offset.row, track.offset.col
+                ));
+            }
+
+            if let Some(c) = track.crop {
+                s.push_str(&format!(
+                    ", cropped to {}x{} at row {}, col {}",
+                    c.cols, c.rows, c.row, c.col
+                ));
+            }
+
+            if let Some(u) = track.until {
+                s.push_str(&format!(", held until {u}"));
+            }
+
+            s
         }
     }
 }
@@ -871,6 +1092,21 @@ mod tests {
             insert_blank: vec![],
             insert_text: vec![],
             insert_cast: vec![],
+            add_track: vec![],
+            track_offset: None,
+            track_crop: None,
+            track_until: None,
+            add_caption: vec![],
+            add_box: vec![],
+            add_highlight: vec![],
+            track_anchor: "s".to_owned(),
+            track_fg: None,
+            track_bg: None,
+            track_bold: false,
+            track_italic: false,
+            track_underline: false,
+            track_inverse: false,
+            track_fill: None,
             duplicate: vec![],
             insert_effect: None,
             edit_text: None,

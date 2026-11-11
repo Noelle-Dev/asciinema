@@ -5,6 +5,7 @@
 //! new recording on demand. This keeps edits undoable and replayable, and lets
 //! the interactive editor and the `--render` path share one implementation.
 
+pub mod composite;
 pub mod edits;
 pub mod fx;
 pub mod render;
@@ -14,5 +15,5 @@ pub mod themes;
 pub mod timeline;
 pub mod tui;
 
-pub use edits::{Clip, Edit, EditList};
+pub use edits::{Clip, Edit, EditList, Track, TrackSource};
 pub use timeline::Timeline;

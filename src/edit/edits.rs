@@ -74,6 +74,163 @@ pub enum Edit {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         styles: Vec<super::style::StyleRun>,
     },
+
+    /// Play another recording on top of this one, from position `at` (after
+    /// `at` events), while this one keeps playing underneath. Tracks stack in
+    /// the order they're listed: later ones on top.
+    Track { at: usize, track: Track },
+}
+
+/// A recording drawn on top of the main one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    pub source: TrackSource,
+    /// Where the track's top-left corner (after cropping) goes on the main
+    /// screen; may be negative. Whatever falls outside the screen is cut off.
+    #[serde(default, skip_serializing_if = "Offset::is_zero")]
+    pub offset: Offset,
+    /// Only this part of the track's screen is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Rect>,
+    /// Keep the track's last screen up until this position of the main
+    /// recording, instead of it disappearing when it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<usize>,
+}
+
+/// What a track plays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TrackSource {
+    /// Events `from..=to` (`to` omitted: to the end) of another recording,
+    /// or of this one when `path` is omitted.
+    Recording {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default)]
+        from: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<usize>,
+    },
+
+    /// Text in a box, for `secs` seconds, placed by `anchor` on the screen
+    /// (then moved by the track's offset). With a background colour, the
+    /// whole box covers what's under it; without one, only the text does.
+    Caption {
+        text: String,
+        secs: f64,
+        #[serde(default = "bottom", skip_serializing_if = "is_bottom")]
+        anchor: super::fx::Anchor,
+        #[serde(default, skip_serializing_if = "is_plain")]
+        style: super::style::TextStyle,
+    },
+
+    /// A `cols`x`rows` box filled with `fill`, for `secs` seconds, at the
+    /// track's offset: hides what's under it.
+    Box {
+        cols: usize,
+        rows: usize,
+        secs: f64,
+        #[serde(default = "full_block", skip_serializing_if = "is_full_block")]
+        fill: char,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<super::style::StyleColor>,
+    },
+
+    /// A `cols`x`rows` area at the track's offset whose cells take on `style`
+    /// (its colours, and whichever of bold, underline... it turns on), for
+    /// `secs` seconds. What's under it still shows.
+    Highlight {
+        cols: usize,
+        rows: usize,
+        secs: f64,
+        style: super::style::TextStyle,
+    },
+}
+
+fn bottom() -> super::fx::Anchor {
+    super::fx::Anchor::S
+}
+
+fn is_bottom(a: &super::fx::Anchor) -> bool {
+    *a == super::fx::Anchor::S
+}
+
+fn is_plain(s: &super::style::TextStyle) -> bool {
+    *s == super::style::TextStyle::default()
+}
+
+fn full_block() -> char {
+    '█'
+}
+
+fn is_full_block(c: &char) -> bool {
+    *c == '█'
+}
+
+impl TrackSource {
+    /// How long a generated track lasts (a recording lasts as long as it does).
+    pub fn secs(&self) -> Option<f64> {
+        match self {
+            TrackSource::Recording { .. } => None,
+            TrackSource::Caption { secs, .. }
+            | TrackSource::Box { secs, .. }
+            | TrackSource::Highlight { secs, .. } => Some(*secs),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            TrackSource::Caption { text, secs, .. } => {
+                let first = text.lines().next().unwrap_or("");
+                format!("caption \"{first}\" for {secs}s")
+            }
+            TrackSource::Box {
+                cols, rows, secs, ..
+            } => {
+                format!("{cols}x{rows} box for {secs}s")
+            }
+            TrackSource::Highlight {
+                cols, rows, secs, ..
+            } => {
+                format!("{cols}x{rows} highlight for {secs}s")
+            }
+            TrackSource::Recording { path, from, to } => {
+                let range = match (from, to) {
+                    (0, None) => String::new(),
+                    (f, None) => format!(" from event {f}"),
+                    (f, Some(t)) => format!(" events {f}..{t}"),
+                };
+
+                match path {
+                    Some(p) => format!("{p}{range}"),
+                    None => format!("this recording{range}"),
+                }
+            }
+        }
+    }
+}
+
+/// A screen position, in rows and columns (may be negative).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Offset {
+    pub row: isize,
+    pub col: isize,
+}
+
+impl Offset {
+    fn is_zero(&self) -> bool {
+        *self == Offset::default()
+    }
+}
+
+/// A rectangle of a screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rect {
+    pub row: usize,
+    pub col: usize,
+    pub rows: usize,
+    pub cols: usize,
 }
 
 /// Something inserted into the timeline.
@@ -215,7 +372,8 @@ pub fn apply_header(original: &Header, edits: &[Edit]) -> Header {
             | Edit::Delete { .. }
             | Edit::Insert { .. }
             | Edit::Replace { .. }
-            | Edit::Text { .. } => {}
+            | Edit::Text { .. }
+            | Edit::Track { .. } => {}
         }
     }
 
@@ -317,7 +475,8 @@ impl EditList {
             | Edit::Delete { .. }
             | Edit::Insert { .. }
             | Edit::Replace { .. }
-            | Edit::Text { .. } => {}
+            | Edit::Text { .. }
+            | Edit::Track { .. } => {}
 
             // header edits: one of each kind
             _ => {
@@ -494,6 +653,71 @@ impl Edit {
                 }
 
                 Ok(())
+            }
+
+            Edit::Track { at, ref track } => {
+                if at > event_count {
+                    bail!("track position {at} out of range (0..={event_count})");
+                }
+
+                if let Some(u) = track.until {
+                    if u < at || u > event_count {
+                        bail!("track end {u} must be between {at} and {event_count}");
+                    }
+                }
+
+                if let Some(c) = track.crop {
+                    if c.rows == 0 || c.cols == 0 {
+                        bail!("a track's crop needs at least one row and one column");
+                    }
+                }
+
+                if let Some(secs) = track.source.secs() {
+                    if !secs.is_finite() || secs <= 0.0 {
+                        bail!("a track's length must be a positive number of seconds, got {secs}");
+                    }
+                }
+
+                match &track.source {
+                    TrackSource::Recording { path, from, to } => validate_clip(
+                        &Clip::Recording {
+                            path: path.clone(),
+                            from: *from,
+                            to: *to,
+                        },
+                        event_count,
+                    ),
+
+                    TrackSource::Caption { text, .. } => {
+                        if text.trim().is_empty() {
+                            bail!("a caption needs some text");
+                        }
+
+                        Ok(())
+                    }
+
+                    TrackSource::Box {
+                        cols, rows, fill, ..
+                    } => {
+                        if *cols == 0 || *rows == 0 {
+                            bail!("a box needs at least one row and one column");
+                        }
+
+                        if fill.is_whitespace() {
+                            bail!("a box filled with spaces would be see-through");
+                        }
+
+                        Ok(())
+                    }
+
+                    TrackSource::Highlight { cols, rows, .. } => {
+                        if *cols == 0 || *rows == 0 {
+                            bail!("a highlight needs at least one row and one column");
+                        }
+
+                        Ok(())
+                    }
+                }
             }
         }
     }

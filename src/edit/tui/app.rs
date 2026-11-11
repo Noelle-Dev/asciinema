@@ -601,6 +601,13 @@ impl App {
             Some(Origin::Cut { to, .. }) => to + 1,
             Some(Origin::Clip { insert }) => self.insert_edit(insert).map_or(0, |(_, at)| at),
             Some(Origin::TextEdit { edit }) => self.text_edit(edit).map_or(0, |(_, at)| at),
+            // a track's drawing between events: before the next one
+            Some(Origin::Track { .. }) => (self.position..self.len())
+                .find_map(|i| match self.timeline.origin(i) {
+                    Some(Origin::Event(e)) => Some(e),
+                    _ => None,
+                })
+                .unwrap_or(self.timeline.original_len()),
             None => self.timeline.original_len(),
         }
     }

@@ -25,7 +25,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use avt::Vt;
 
-use super::edits::Clip;
+use super::composite::{self, Painter};
+use super::edits::{Clip, Track, TrackSource};
 use super::{retime, Edit, EditList};
 use crate::asciicast::{self, Asciicast, Event, EventData, Header, Version};
 
@@ -41,7 +42,7 @@ const CLIP_TAIL: Duration = Duration::from_secs(1);
 /// Puts a terminal in the state avt's screen dump expects: primary screen,
 /// default modes (soft reset, which leaves colors and cursor shape alone),
 /// cleared, cursor home.
-const REDRAW_PREFIX: &str = "\x1b[?1049l\x1b[!p\x1b[H\x1b[2J";
+pub(crate) const REDRAW_PREFIX: &str = "\x1b[?1049l\x1b[!p\x1b[H\x1b[2J";
 
 /// Where a playlist item came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,19 +55,24 @@ pub enum Origin {
     Clip { insert: usize },
     /// Drawing of the `edit`-th text edit (counting text edits in order).
     TextEdit { edit: usize },
+    /// Drawing of the `track`-th track (counting track edits in order).
+    Track { track: usize },
 }
 
+#[derive(Clone)]
 enum ItemData {
     Original(usize),
     Owned(EventData),
 }
 
+#[derive(Clone)]
 enum Delay {
     /// The (edited) delay of an original event.
     Of(usize),
     Fixed(Duration),
 }
 
+#[derive(Clone)]
 struct Item {
     data: ItemData,
     delay: Delay,
@@ -127,6 +133,12 @@ pub struct Timeline {
     /// The recording with its text edits, when there are any.
     base: Option<Base>,
 
+    /// The playlist before tracks are drawn over it, and its keyframes.
+    main: Vec<Item>,
+    main_keyframes: Keyframes,
+    /// The track edits the playlist was composited with: (at, track).
+    tracks: Vec<(usize, Track)>,
+
     /// Directory that relative clip paths are resolved against.
     clip_base: PathBuf,
     sources: Mutex<HashMap<PathBuf, Arc<Source>>>,
@@ -146,7 +158,7 @@ impl Timeline {
         let size = (header.term_cols as usize, header.term_rows as usize);
         let original_keyframes = Keyframes::build(size, events.iter().map(|e| &e.data));
 
-        let items = (0..events.len())
+        let items: Vec<Item> = (0..events.len())
             .map(|i| Item {
                 data: ItemData::Original(i),
                 delay: Delay::Of(i),
@@ -163,9 +175,12 @@ impl Timeline {
             times: original_times.clone(),
             event_pos: (0..events.len()).map(Some).collect(),
             keyframes: original_keyframes.clone(),
+            main_keyframes: original_keyframes.clone(),
             original_keyframes,
             original_times,
             events,
+            main: items.clone(),
+            tracks: Vec::new(),
             items,
             structure: Vec::new(),
             base: None,
@@ -278,48 +293,109 @@ impl Timeline {
             .cloned()
             .collect();
 
-        if structure != self.structure {
+        let tracks: Vec<(usize, Track)> = edits
+            .edits
+            .iter()
+            .filter_map(|e| match e {
+                Edit::Track { at, track } => Some((*at, track.clone())),
+                _ => None,
+            })
+            .collect();
+
+        let size = (
+            self.original_header.term_cols as usize,
+            self.original_header.term_rows as usize,
+        );
+
+        // the playlist without tracks: rebuilt when the structure changes
+        let rebuilt = if structure != self.structure {
             let base = self.build_base(&structure);
             let items = self.compile(&structure, base.as_ref())?;
-            let size = (
-                self.original_header.term_cols as usize,
-                self.original_header.term_rows as usize,
-            );
-
             let events = &self.events;
-            self.keyframes =
+            let keyframes =
                 Keyframes::build(size, items.iter().map(|item| item_data(events, item)));
-            self.event_pos = vec![None; self.events.len()];
 
-            for (i, item) in items.iter().enumerate() {
-                if let Origin::Event(e) = item.origin {
-                    self.event_pos[e] = Some(i);
-                }
-            }
+            Some((items, keyframes, base))
+        } else {
+            None
+        };
 
-            self.items = items;
-            self.base = base;
-            self.structure = structure;
-            self.structure_version += 1;
-        }
+        let (main, main_keyframes) = match &rebuilt {
+            Some((items, keyframes, _)) => (items, keyframes),
+            None => (&self.main, &self.main_keyframes),
+        };
 
         let retimed = retime::apply(&self.original_times, &edits.edits);
-        self.delays = retime::delays(&retimed);
-
+        let delays = retime::delays(&retimed);
         let mut t = Duration::ZERO;
 
-        self.times = self
-            .items
+        let main_times: Vec<Duration> = main
             .iter()
             .map(|item| {
                 t += match item.delay {
-                    Delay::Of(e) => self.delays[e],
+                    Delay::Of(e) => delays[e],
                     Delay::Fixed(d) => d,
                 };
 
                 t
             })
             .collect();
+
+        // tracks drawn over it: redone whenever anything changes, as
+        // retiming the recording moves the tracks' events among its own
+        let composited = if tracks.is_empty() {
+            None
+        } else {
+            let (items, times) = self.composite(main, main_keyframes, &main_times, &tracks)?;
+            let events = &self.events;
+            let keyframes =
+                Keyframes::build(size, items.iter().map(|item| item_data(events, item)));
+
+            Some((items, times, keyframes))
+        };
+
+        // nothing failed: commit
+        let changed = rebuilt.is_some() || composited.is_some() || !self.tracks.is_empty();
+
+        if let Some((items, keyframes, base)) = rebuilt {
+            self.main = items;
+            self.main_keyframes = keyframes;
+            self.base = base;
+            self.structure = structure;
+        }
+
+        self.delays = delays;
+
+        match composited {
+            Some((items, times, keyframes)) => {
+                self.items = items;
+                self.times = times;
+                self.keyframes = keyframes;
+            }
+
+            None => {
+                if changed {
+                    self.items = self.main.clone();
+                    self.keyframes = self.main_keyframes.clone();
+                }
+
+                self.times = main_times;
+            }
+        }
+
+        if changed {
+            self.event_pos = vec![None; self.events.len()];
+
+            for (i, item) in self.items.iter().enumerate() {
+                if let Origin::Event(e) = item.origin {
+                    self.event_pos[e].get_or_insert(i);
+                }
+            }
+
+            self.structure_version += 1;
+        }
+
+        self.tracks = tracks;
 
         self.header = super::edits::apply_header(&self.original_header, &edits.edits);
 
@@ -370,7 +446,7 @@ impl Timeline {
     /// edits). Those draw at fixed screen positions, so they only line up
     /// when playback starts on a cleared screen.
     pub fn draws_edits(&self) -> bool {
-        !self.structure.is_empty()
+        !self.structure.is_empty() || !self.tracks.is_empty()
     }
 
     pub fn edited_events(&self) -> impl Iterator<Item = Event> + '_ {
@@ -510,6 +586,320 @@ impl Timeline {
         }
 
         Ok(b.items)
+    }
+
+    /// Draws `tracks` over the playlist `main` (played at `times`): returns
+    /// the new playlist and its times. Outside tracks the playlist plays as
+    /// before; while any is showing, the screen is drawn as the composite
+    /// of the main screen and the tracks, as just the cells that change.
+    fn composite(
+        &self,
+        main: &[Item],
+        main_keyframes: &Keyframes,
+        times: &[Duration],
+        tracks: &[(usize, Track)],
+    ) -> Result<(Vec<Item>, Vec<Duration>)> {
+        let n = self.events.len();
+
+        // where the main playlist reaches original position `p`
+        let main_pos = |p: usize| {
+            main.iter()
+                .position(|item| matches!(item.origin, Origin::Event(e) if e >= p))
+                .unwrap_or(main.len())
+        };
+
+        let time_at = |pos: usize| pos.checked_sub(1).map_or(Duration::ZERO, |i| times[i]);
+
+        /// A track, resolved: its events (with times on the main timeline)
+        /// and its screen when it starts.
+        struct Placed<'a> {
+            track: &'a Track,
+            pos: usize,
+            start: Duration,
+            end: Duration,
+            events: Vec<(Duration, EventData)>,
+            vt: Vt,
+            /// For a highlight: the area and style it restyles with.
+            restyle: Option<(usize, usize, super::style::TextStyle)>,
+            /// Where its top-left corner goes.
+            offset: super::edits::Offset,
+        }
+
+        let mut placed = Vec::with_capacity(tracks.len());
+        let screen = (
+            self.original_header.term_cols as usize,
+            self.original_header.term_rows as usize,
+        );
+
+        for (at, track) in tracks {
+            let pos = main_pos(*at);
+            let start = time_at(pos);
+            let until = track.until.map(|u| time_at(main_pos(u.min(n))));
+
+            // tracks the editor draws: one screen, for a while
+            if let Some(secs) = track.source.secs() {
+                let (vt, restyle, offset) = generated(&track.source, screen);
+                let end = start + Duration::from_secs_f64(secs);
+
+                placed.push(Placed {
+                    track,
+                    pos,
+                    start,
+                    end: until.map_or(end, |u| end.max(u)),
+                    events: Vec::new(),
+                    vt,
+                    restyle,
+                    offset: super::edits::Offset {
+                        row: offset.row + track.offset.row,
+                        col: offset.col + track.offset.col,
+                    },
+                });
+
+                continue;
+            }
+
+            let TrackSource::Recording { path, from, to } = &track.source else {
+                unreachable!("only recordings have no set length");
+            };
+
+            let source = match path {
+                Some(p) => Some(self.source(p)?),
+                None => None,
+            };
+
+            let (events, keyframes) = match &source {
+                Some(s) => (&s.events, &s.keyframes),
+                None => (&self.events, &self.original_keyframes),
+            };
+
+            let last = to.unwrap_or(events.len().saturating_sub(1));
+
+            if events.is_empty() || *from > last || last >= events.len() {
+                bail!(
+                    "track range {from}..{last} is out of range for a recording with {} events",
+                    events.len()
+                );
+            }
+
+            let base = from
+                .checked_sub(1)
+                .map_or(Duration::ZERO, |i| events[i].time);
+            let rel = |t: Duration| start + t.saturating_sub(base);
+
+            let mut end = match events.get(last + 1) {
+                Some(next) => rel(next.time),
+                None => rel(events[last].time) + CLIP_TAIL,
+            };
+
+            if let Some(u) = until {
+                end = end.max(u);
+            }
+
+            let drawing = events[*from..=last]
+                .iter()
+                .filter(|e| matches!(e.data, EventData::Output(_) | EventData::Resize(..)))
+                .map(|e| (rel(e.time), e.data.clone()))
+                .collect();
+
+            placed.push(Placed {
+                track,
+                pos,
+                start,
+                end,
+                events: drawing,
+                vt: keyframes.vt_at(*from, |i| &events[i].data),
+                restyle: None,
+                offset: track.offset,
+            });
+        }
+
+        // everything that happens, in order: (time, main position it's
+        // before on a tie, kind order, step)
+        #[derive(Clone, Copy)]
+        enum Step {
+            Main(usize),
+            Start(usize),
+            Event(usize, usize),
+            End(usize),
+        }
+
+        type Key = (Duration, usize, u8, usize, usize);
+        let mut steps: Vec<(Key, Step)> = Vec::new();
+
+        for (i, &t) in times.iter().enumerate() {
+            steps.push(((t, i, 1, 0, 0), Step::Main(i)));
+        }
+
+        for (k, p) in placed.iter().enumerate() {
+            steps.push(((p.start, p.pos, 0, k, 0), Step::Start(k)));
+
+            for (j, (t, _)) in p.events.iter().enumerate() {
+                steps.push(((*t, p.pos, 0, k, j + 1), Step::Event(k, j)));
+            }
+
+            steps.push(((p.end.max(p.start), p.pos, 0, k, usize::MAX), Step::End(k)));
+        }
+
+        // times only go forward: a track's events never come before its start
+        steps.sort_by_key(|(key, _)| *key);
+
+        let mut items: Vec<Item> = Vec::with_capacity(main.len() + steps.len());
+        let mut out_times: Vec<Duration> = Vec::with_capacity(items.capacity());
+        let mut active = vec![false; placed.len()];
+        // the main screen, while tracks are showing
+        let mut screen: Option<(Vt, Painter)> = None;
+        let mut applied = 0; // main items applied so far
+        let mut prev = Duration::ZERO;
+
+        let mut emit =
+            |items: &mut Vec<Item>, t: Duration, data: ItemData, delay: Option<Delay>, origin| {
+                let d = t.saturating_sub(prev);
+                prev = prev.max(t);
+                items.push(Item {
+                    data,
+                    delay: delay.unwrap_or(Delay::Fixed(d)),
+                    origin,
+                });
+                out_times.push(t.max(out_times.last().copied().unwrap_or_default()));
+            };
+
+        let repaint = |placed: &[Placed], active: &[bool], main: &Vt, painter: &mut Painter| {
+            let layers: Vec<composite::Layer> = placed
+                .iter()
+                .zip(active)
+                .filter(|(_, &on)| on)
+                .map(|(p, _)| composite::Layer {
+                    content: match p.restyle {
+                        Some((cols, rows, style)) => {
+                            composite::Content::Style { cols, rows, style }
+                        }
+                        None => composite::Content::Screen(&p.vt),
+                    },
+                    crop: p.track.crop,
+                    offset: p.offset,
+                })
+                .collect();
+
+            painter.paint(&composite::compose(main, &layers), main)
+        };
+
+        for (key, step) in steps {
+            let t = key.0;
+
+            match step {
+                Step::Main(i) => {
+                    let item = &main[i];
+                    applied = i + 1;
+
+                    let Some((vt, painter)) = &mut screen else {
+                        emit(
+                            &mut items,
+                            t,
+                            item.data.clone(),
+                            Some(item.delay.clone()),
+                            item.origin,
+                        );
+                        continue;
+                    };
+
+                    let data = item_data(&self.events, item);
+
+                    match data {
+                        EventData::Output(_) => {
+                            feed(vt, data);
+                            let s = repaint(&placed, &active, vt, painter);
+                            emit(
+                                &mut items,
+                                t,
+                                output(s),
+                                Some(item.delay.clone()),
+                                item.origin,
+                            );
+                        }
+
+                        // resized: start over at the new size
+                        EventData::Resize(..) => {
+                            feed(vt, data);
+                            emit(
+                                &mut items,
+                                t,
+                                item.data.clone(),
+                                Some(item.delay.clone()),
+                                item.origin,
+                            );
+
+                            *painter = Painter::new(vt.size());
+                            let s = format!(
+                                "{}{}",
+                                Painter::start(),
+                                repaint(&placed, &active, vt, painter)
+                            );
+                            emit(&mut items, t, output(s), None, item.origin);
+                        }
+
+                        _ => emit(
+                            &mut items,
+                            t,
+                            item.data.clone(),
+                            Some(item.delay.clone()),
+                            item.origin,
+                        ),
+                    }
+                }
+
+                Step::Start(k) => {
+                    active[k] = true;
+                    let origin = Origin::Track { track: k };
+
+                    // the first track: from here on the screen is drawn as
+                    // the composite, starting on a cleared screen
+                    let entering = screen.is_none();
+
+                    let (vt, painter) = screen.get_or_insert_with(|| {
+                        let vt =
+                            main_keyframes.vt_at(applied, |i| item_data(&self.events, &main[i]));
+                        let painter = Painter::new(vt.size());
+                        (vt, painter)
+                    });
+
+                    let mut s = repaint(&placed, &active, vt, painter);
+
+                    if entering {
+                        s = format!("{}{s}", Painter::start());
+                    }
+
+                    emit(&mut items, t, output(s), None, origin);
+                }
+
+                Step::Event(k, j) => {
+                    let p = &mut placed[k];
+                    feed(&mut p.vt, &p.events[j].1);
+
+                    if let Some((vt, painter)) = &mut screen {
+                        let s = repaint(&placed, &active, vt, painter);
+                        emit(&mut items, t, output(s), None, Origin::Track { track: k });
+                    }
+                }
+
+                Step::End(k) => {
+                    active[k] = false;
+                    let origin = Origin::Track { track: k };
+
+                    if active.iter().any(|&a| a) {
+                        if let Some((vt, painter)) = &mut screen {
+                            let s = repaint(&placed, &active, vt, painter);
+                            emit(&mut items, t, output(s), None, origin);
+                        }
+                    } else if let Some((vt, _)) = screen.take() {
+                        // the last track's gone: back to the recording as it is
+                        let s = format!("{REDRAW_PREFIX}{}", vt.dump());
+                        emit(&mut items, t, output(s), None, origin);
+                    }
+                }
+            }
+        }
+
+        Ok((items, out_times))
     }
 
     fn push_clip(
@@ -746,6 +1136,118 @@ impl Timeline {
             .insert(full, source.clone());
 
         Ok(source)
+    }
+}
+
+/// The screen a track the editor draws shows (a caption or a box), or for a
+/// highlight, the area and style it restyles with; and where it goes on a
+/// `screen`-sized terminal (before the track's own offset).
+#[allow(clippy::type_complexity)]
+fn generated(
+    source: &TrackSource,
+    (cols, rows): (usize, usize),
+) -> (
+    Vt,
+    Option<(usize, usize, super::style::TextStyle)>,
+    super::edits::Offset,
+) {
+    use super::edits::Offset;
+    use super::fx::Anchor;
+    use super::style::TextStyle;
+
+    match source {
+        TrackSource::Caption {
+            text,
+            anchor,
+            style,
+            ..
+        } => {
+            // with a background, the box is padded and all of it covers (a
+            // track's spaces are see-through, so its blanks are drawn as
+            // blocks in the background colour)
+            let boxed = style.bg.is_some();
+            let pad = usize::from(boxed);
+            let lines: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+            let w = lines.iter().map(Vec::len).max().unwrap_or(0) + 2 * pad;
+            let h = lines.len().max(1);
+
+            let mut vt = new_vt(w.max(1), h);
+            let blank = TextStyle {
+                fg: style.bg,
+                ..*style
+            };
+
+            for (r, line) in lines.iter().enumerate() {
+                let mut out = format!("\x1b[{};1H", r + 1);
+                let padded = std::iter::repeat_n(' ', pad)
+                    .chain(line.iter().copied())
+                    .chain(std::iter::repeat(' '))
+                    .take(w);
+
+                for ch in padded {
+                    if ch == ' ' && boxed {
+                        out.push_str(&blank.sgr());
+                        out.push('█');
+                    } else {
+                        out.push_str(&style.sgr());
+                        out.push(ch);
+                    }
+                }
+
+                vt.feed_str(&out);
+            }
+
+            let col = match anchor {
+                Anchor::Nw | Anchor::W | Anchor::Sw => 0,
+                Anchor::N | Anchor::C | Anchor::S => cols.saturating_sub(w) / 2,
+                Anchor::Ne | Anchor::E | Anchor::Se => cols.saturating_sub(w),
+            };
+
+            let row = match anchor {
+                Anchor::Nw | Anchor::N | Anchor::Ne => 0,
+                Anchor::W | Anchor::C | Anchor::E => rows.saturating_sub(h) / 2,
+                Anchor::Sw | Anchor::S | Anchor::Se => rows.saturating_sub(h),
+            };
+
+            (
+                vt,
+                None,
+                Offset {
+                    row: row as isize,
+                    col: col as isize,
+                },
+            )
+        }
+
+        TrackSource::Box {
+            cols: w,
+            rows: h,
+            fill,
+            color,
+            ..
+        } => {
+            let mut vt = new_vt(*w, *h);
+            let style = TextStyle {
+                fg: *color,
+                ..Default::default()
+            };
+
+            for r in 0..*h {
+                let row: String = std::iter::repeat_n(*fill, *w).collect();
+                vt.feed_str(&format!("\x1b[{};1H{}{row}", r + 1, style.sgr()));
+            }
+
+            (vt, None, Offset::default())
+        }
+
+        TrackSource::Highlight {
+            cols: w,
+            rows: h,
+            style,
+            ..
+        } => (new_vt(1, 1), Some((*w, *h, *style)), Offset::default()),
+
+        TrackSource::Recording { .. } => unreachable!("recordings aren't generated"),
     }
 }
 
@@ -1857,5 +2359,252 @@ mod tests {
             .collect();
 
         assert!(pasted.is_empty(), "markers aren't pasted");
+    }
+
+    fn track(at: usize, from: usize, to: usize, row: isize, col: isize) -> Edit {
+        Edit::Track {
+            at,
+            track: crate::edit::Track {
+                source: crate::edit::TrackSource::Recording {
+                    path: None,
+                    from,
+                    to: Some(to),
+                },
+                offset: crate::edit::edits::Offset { row, col },
+                crop: None,
+                until: None,
+            },
+        }
+    }
+
+    fn at_secs(tl: &Timeline, secs: f64) -> Vt {
+        tl.vt_at(Duration::from_secs_f64(secs))
+    }
+
+    #[test]
+    fn tracks_play_on_top_and_then_disappear() {
+        let outputs = [
+            (1, "aaaa\r\n"),
+            (2, "bb bb\r\n"),
+            (3, "cccc\r\n"),
+            (10, "dddd"),
+        ];
+        let original = simple(&outputs);
+        let mut tl = simple(&outputs);
+
+        // events 0..=1 of this recording, from after event 0 (1s), at row 3, col 10
+        apply(&mut tl, vec![track(1, 0, 1, 3, 10)]);
+
+        // its first event plays 1s in (at 2s), its second 1s later
+        let vt = at_secs(&tl, 2.5);
+        assert_eq!(row(&vt, 1), "bb bb");
+        assert_eq!(row(&vt, 3), "          aaaa");
+
+        let vt = at_secs(&tl, 3.5);
+        assert_eq!(row(&vt, 2), "cccc");
+        assert_eq!(row(&vt, 3), "          aaaa");
+        assert_eq!(row(&vt, 4), "          bb bb");
+
+        // the cursor is where the recording's is
+        assert_eq!((vt.cursor().row, vt.cursor().col), (3, 0));
+        assert!(vt.cursor().visible);
+
+        // it ends when its next event would have come (3s in, at 4s)
+        for secs in [4.0, 5.0, 10.0, 11.0] {
+            assert_eq!(
+                screen(&at_secs(&tl, secs)),
+                screen(&at_secs(&original, secs)),
+                "at {secs}s"
+            );
+        }
+
+        // straight playback agrees with seeking
+        let mut linear = new_vt(20, 5);
+        tl.advance(&mut linear, 0, tl.len());
+        assert_eq!(screen(&linear), screen(&tl.vt_at_position(tl.len())));
+        assert_eq!(tl.duration(), Duration::from_secs(10));
+        assert!(tl.draws_edits());
+    }
+
+    #[test]
+    fn tracks_are_see_through_layered_and_cut_off_at_the_edge() {
+        let outputs = [(1, "1234567890123456789"), (2, "\r\nX Y"), (3, "\r\nZZZ")];
+        let mut tl = simple(&outputs);
+
+        // from after event 1 (2s): a slice starts on the screen before it,
+        // so the tracks' first rows are the digits, moved off screen.
+        // "X Y" over the first row from column 18: "X" at 18, "Y" off
+        // screen; then "ZZZ" (a later track, so on top) from column 16
+        apply(
+            &mut tl,
+            vec![track(2, 1, 1, -1, 18), track(2, 2, 2, -2, 16)],
+        );
+
+        let vt = at_secs(&tl, 3.5);
+        assert_eq!(row(&vt, 0), "1234567890123456ZZZ");
+        // the tracks' blank rows show the recording
+        assert_eq!(row(&vt, 1), "X Y");
+        assert_eq!(row(&vt, 2), "ZZZ");
+    }
+
+    #[test]
+    fn a_covered_cursor_is_hidden() {
+        let outputs = [(1, "ab"), (2, "XYZ"), (9, "!")];
+        let mut tl = simple(&outputs);
+
+        // event 1 ("XYZ", after "ab") from column 1: covers the cursor
+        // (after "abXYZ")
+        apply(&mut tl, vec![track(1, 1, 1, 0, 1)]);
+
+        let vt = at_secs(&tl, 3.5);
+        assert_eq!(row(&vt, 0), "aabXYZ");
+        assert_eq!((vt.cursor().row, vt.cursor().col), (0, 5));
+        assert!(!vt.cursor().visible);
+    }
+
+    #[test]
+    fn retiming_moves_the_recording_under_its_tracks() {
+        let outputs = [(1, "a"), (2, "b"), (3, "c"), (4, "d")];
+        let mut tl = simple(&outputs);
+
+        // a track of event 3 ("d", after "abc") at row 2, from after event
+        // 0 (at 1s); "d" comes 1s after "c", at 2s, and it's gone at 3s
+        let mut edits = vec![track(1, 3, 3, 2, 0)];
+        apply(&mut tl, edits.clone());
+        assert_eq!(row(&at_secs(&tl, 1.5), 2), "abc");
+        assert_eq!(row(&at_secs(&tl, 2.5), 2), "abcd");
+        assert_eq!(row(&at_secs(&tl, 2.5), 0), "ab");
+
+        // slowing the recording down leaves the track's timing alone
+        edits.push(Edit::SetDelay {
+            event: 1,
+            secs: 5.0,
+        });
+        apply(&mut tl, edits);
+        assert_eq!(row(&at_secs(&tl, 2.5), 2), "abcd");
+        assert_eq!(row(&at_secs(&tl, 2.5), 0), "a");
+        assert_eq!(row(&at_secs(&tl, 6.5), 0), "ab");
+        assert_eq!(row(&at_secs(&tl, 6.5), 2), "");
+        assert_eq!(
+            tl.position_of_event(1).map(|p| tl.origin(p)),
+            Some(Some(Origin::Event(1)))
+        );
+    }
+
+    fn generated(at: usize, source: crate::edit::TrackSource, row: isize, col: isize) -> Edit {
+        Edit::Track {
+            at,
+            track: crate::edit::Track {
+                source,
+                offset: crate::edit::edits::Offset { row, col },
+                crop: None,
+                until: None,
+            },
+        }
+    }
+
+    #[test]
+    fn captions_sit_at_the_bottom_and_cover_with_a_background() {
+        use crate::edit::style::{StyleColor, TextStyle};
+        use crate::edit::TrackSource;
+
+        let outputs = [
+            (1, "line one\r\nline two\r\nline three\r\nfour\r\nfive"),
+            (9, "!"),
+        ];
+        let mut tl = simple(&outputs);
+
+        // "hi there" on red: padded, bottom centre of 20x5, for 2s from 1s
+        let caption = TrackSource::Caption {
+            text: "hi there".to_owned(),
+            secs: 2.0,
+            anchor: crate::edit::fx::Anchor::S,
+            style: TextStyle {
+                bg: Some(StyleColor::Indexed(1)),
+                ..Default::default()
+            },
+        };
+        apply(&mut tl, vec![generated(1, caption, 0, 0)]);
+
+        let vt = at_secs(&tl, 2.0);
+        // 10 wide (8 + padding), centred: columns 5..15; its blanks are blocks
+        assert_eq!(row(&vt, 4), "five █hi█there█");
+        assert_eq!(
+            vt.line(4).cells()[6].pen().background(),
+            Some(avt::Color::Indexed(1))
+        );
+        assert_eq!(row(&vt, 3), "four", "one line tall");
+
+        // gone after 2s
+        assert_eq!(row(&at_secs(&tl, 3.5), 4), "five");
+    }
+
+    #[test]
+    fn boxes_hide_and_highlights_restyle() {
+        use crate::edit::style::{StyleColor, TextStyle};
+        use crate::edit::TrackSource;
+
+        let mut tl = simple(&[(1, "user: me@ex.com"), (9, "!")]);
+
+        let box_ = TrackSource::Box {
+            cols: 9,
+            rows: 1,
+            secs: 5.0,
+            fill: '█',
+            color: None,
+        };
+        let highlight = TrackSource::Highlight {
+            cols: 4,
+            rows: 1,
+            secs: 5.0,
+            style: TextStyle {
+                fg: Some(StyleColor::Indexed(2)),
+                bold: true,
+                ..Default::default()
+            },
+        };
+        apply(
+            &mut tl,
+            vec![generated(1, box_, 0, 6), generated(1, highlight, 0, 0)],
+        );
+
+        let vt = at_secs(&tl, 3.0);
+        assert_eq!(row(&vt, 0), "user: █████████");
+
+        // the highlight keeps the text and restyles it
+        let pen = *vt.line(0).cells()[1].pen();
+        assert_eq!(pen.foreground(), Some(avt::Color::Indexed(2)));
+        assert!(pen.is_bold());
+        assert_eq!(vt.line(0).cells()[4].pen().foreground(), None);
+
+        // the cursor (at the end of the line, past the box) still shows
+        assert!(vt.cursor().visible);
+
+        // and after 5s, all back
+        let vt = at_secs(&tl, 7.0);
+        assert_eq!(row(&vt, 0), "user: me@ex.com");
+        assert_eq!(vt.line(0).cells()[1].pen().foreground(), None);
+    }
+
+    #[test]
+    fn generated_tracks_last_until_a_position_if_later() {
+        use crate::edit::TrackSource;
+
+        let mut tl = simple(&[(1, "a"), (2, "b"), (10, "c"), (11, "d")]);
+        let box_ = TrackSource::Box {
+            cols: 2,
+            rows: 1,
+            secs: 1.0,
+            fill: '#',
+            color: None,
+        };
+        let Edit::Track { at, mut track } = generated(1, box_, 2, 0) else {
+            unreachable!()
+        };
+        track.until = Some(3); // until "c", at 10s
+        apply(&mut tl, vec![Edit::Track { at, track }]);
+
+        assert_eq!(row(&at_secs(&tl, 9.0), 2), "##");
+        assert_eq!(row(&at_secs(&tl, 10.5), 2), "");
     }
 }
