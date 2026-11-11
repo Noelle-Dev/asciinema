@@ -297,7 +297,11 @@ impl Painter {
 
                 let chr = cell.char();
 
-                if chr != ' ' {
+                // block elements fill their part of the cell exactly, so
+                // rows of them join up (a font's glyphs leave gaps)
+                if let Some((bx, by, bw, bh)) = block_element(chr, w, ch) {
+                    self.fill(img, x + bx, y + by, bw, bh, fg);
+                } else if chr != ' ' {
                     self.glyph(img, chr, pen.is_bold(), x, y + baseline, fg);
                 }
 
@@ -367,6 +371,18 @@ impl Painter {
             }
         }
     }
+}
+
+/// The part of a `w`x`h` cell a block element covers: (x, y, width, height).
+fn block_element(chr: char, w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
+    Some(match chr {
+        '█' => (0, 0, w, h),
+        '▀' => (0, 0, w, h / 2),
+        '▄' => (0, h / 2, w, h - h / 2),
+        '▌' => (0, 0, w / 2, h),
+        '▐' => (w / 2, 0, w - w / 2, h),
+        _ => return None,
+    })
 }
 
 /// `a` over `b`, with `a`'s weight `t` (0..=1).
